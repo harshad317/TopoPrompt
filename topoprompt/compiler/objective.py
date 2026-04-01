@@ -23,15 +23,18 @@ def search_score(
     mean_invocations: float,
     complexity: float,
     parse_failure_rate: float,
+    coverage_ratio: float,
     objective_config: ObjectiveConfig,
     program_config: ProgramConfig,
 ) -> float:
     cost_norm = min(mean_invocations / max(program_config.max_nodes, 1), 1.0)
+    coverage_penalty = objective_config.delta_partial_coverage * max(1.0 - coverage_ratio, 0.0)
     return (
         perf
         - objective_config.alpha_cost * cost_norm
         - objective_config.beta_complexity * complexity
         - objective_config.gamma_parse_failure * parse_failure_rate
+        - coverage_penalty
     )
 
 
@@ -49,4 +52,3 @@ def compute_variance_adaptive_epsilon(candidates: list[CandidateEvaluation], obj
     else:
         se = pstdev(scores) / sqrt(max(len(scores), 1))
     return max(objective_config.epsilon_floor, objective_config.epsilon_z * se)
-

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from topoprompt.compiler.search import (
+    _budgeted_stage_example_cap,
     _select_affordable_confirmation_candidates,
     _select_final_selection_pool,
     compile_task,
@@ -10,6 +11,7 @@ from topoprompt.compiler.search import (
 )
 from topoprompt.compiler.seeds import instantiate_seed_program
 from topoprompt.config import TopoPromptConfig
+from topoprompt.compiler.objective import search_score
 from topoprompt.eval.budget import BudgetLedger
 from topoprompt.eval.metrics import numeric_metric
 from topoprompt.schemas import CandidateEvaluation, Example, PromptProgram, TaskAnalysis
@@ -214,3 +216,56 @@ def test_affordable_confirmation_selection_preserves_top_ranked_prefix(simple_ta
     )
 
     assert [candidate.program.program_id for candidate in selected] == ["plan_solve_finalize"]
+
+
+def test_budgeted_stage_example_cap_reserves_budget_for_remaining_candidates(simple_task_spec):
+    config = TopoPromptConfig.model_validate(
+        {
+            "compile": {
+                "screening_budget_calls": 12,
+                "narrowing_budget_calls": 0,
+                "confirmation_budget_calls": 0,
+                "reserve_budget_calls": 0,
+            }
+        }
+    )
+    analysis = TaskAnalysis(needs_reasoning=True, initial_seed_templates=["plan_solve_finalize"])
+    program = instantiate_seed_program(task_spec=simple_task_spec, analysis=analysis, template_name="plan_solve_finalize")
+    assert program is not None
+
+    budget = BudgetLedger.from_compile_config(config.compile)
+    cap = _budgeted_stage_example_cap(
+        program=program,
+        phase="screening",
+        configured_examples=8,
+        budget=budget,
+        remaining_candidates=3,
+        config=config,
+    )
+
+    assert cap == 2
+
+
+def test_search_score_penalizes_partial_coverage():
+    config = TopoPromptConfig()
+
+    full_score = search_score(
+        perf=0.75,
+        mean_invocations=2.0,
+        complexity=0.14,
+        parse_failure_rate=0.0,
+        coverage_ratio=1.0,
+        objective_config=config.objective,
+        program_config=config.program,
+    )
+    partial_score = search_score(
+        perf=0.75,
+        mean_invocations=2.0,
+        complexity=0.14,
+        parse_failure_rate=0.0,
+        coverage_ratio=0.25,
+        objective_config=config.objective,
+        program_config=config.program,
+    )
+
+    assert partial_score < full_score

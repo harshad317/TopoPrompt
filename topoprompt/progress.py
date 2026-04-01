@@ -76,6 +76,12 @@ class CompileProgressReporter:
     def log_candidate(self, candidate: Any, *, prefix: str = "", level: int = 2) -> None:
         if not self.enabled or self.verbosity < level:
             return
+        coverage_text = ""
+        metadata = getattr(candidate, "metadata", {}) or {}
+        examples_evaluated = metadata.get("examples_evaluated")
+        target_examples = metadata.get("target_examples")
+        if examples_evaluated is not None and target_examples:
+            coverage_text = f" coverage={examples_evaluated}/{target_examples}"
         self.log(
             (
                 f"{prefix}{candidate.program.program_id} "
@@ -86,6 +92,7 @@ class CompileProgressReporter:
                 f"tokens={candidate.mean_tokens:.2f} "
                 f"complexity={candidate.complexity:.3f} "
                 f"parse_fail={candidate.parse_failure_rate:.3f}"
+                f"{coverage_text}"
             ),
             level=level,
             style="green",

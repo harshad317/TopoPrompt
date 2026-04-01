@@ -51,6 +51,7 @@ objective:
   alpha_cost: 0.05
   beta_complexity: 0.10
   gamma_parse_failure: 0.20
+  delta_partial_coverage: 0.25
   epsilon_mode: variance_adaptive
   epsilon_floor: 0.01
   epsilon_z: 1.0
@@ -61,4 +62,3 @@ runtime:
   cache_enabled: true
   cache_dir: ".topoprompt_cache"
   route_mode_default: self_route_llm
-

@@ -535,6 +535,7 @@ def _evaluate_candidate(
     complexity = description_length(program, config.program)
     mean_invocations = mean(trace.total_invocations for trace in traces)
     mean_tokens = mean(trace.total_tokens for trace in traces)
+    coverage_ratio = len(traces) / max(len(scoped_examples), 1)
     parse_failure_rate = sum(trace.parse_failures for trace in traces) / max(
         1, sum(len(trace.node_traces) for trace in traces)
     )
@@ -553,6 +554,7 @@ def _evaluate_candidate(
             mean_invocations=mean_invocations,
             complexity=complexity,
             parse_failure_rate=parse_failure_rate,
+            coverage_ratio=coverage_ratio,
             objective_config=config.objective,
             program_config=config.program,
         ),
@@ -567,6 +569,7 @@ def _evaluate_candidate(
             "examples_evaluated": len(traces),
             "target_examples": len(scoped_examples),
             "fully_evaluated": fully_evaluated,
+            "coverage_ratio": coverage_ratio,
         },
     )
     if reporter is not None:
@@ -587,13 +590,26 @@ def _evaluate_candidates_multi_fidelity(
     reporter: CompileProgressReporter | None = None,
 ) -> list[CandidateEvaluation]:
     screened: list[CandidateEvaluation] = []
-    for program, parent_id, edit_applied in (reporter.track(
+    proposal_iterable = reporter.track(
         proposals,
         desc="Screening candidates",
         total=len(proposals),
         leave=False,
         level=1,
-    ) if reporter is not None else proposals):
+    ) if reporter is not None else proposals
+    for index, (program, parent_id, edit_applied) in enumerate(proposal_iterable):
+        screening_examples = _budgeted_stage_example_cap(
+            program=program,
+            phase="screening",
+            configured_examples=config.compile.screening_examples,
+            budget=budget,
+            remaining_candidates=len(proposals) - index,
+            config=config,
+        )
+        if screening_examples <= 0:
+            if reporter is not None:
+                reporter.log("Screening budget is exhausted before all candidates could be scored.", level=1)
+            break
         evaluation = _evaluate_candidate(
             program=program,
             task_spec=task_spec,
@@ -604,7 +620,7 @@ def _evaluate_candidates_multi_fidelity(
             budget=budget,
             phase="screening",
             stage="screening",
-            max_examples=config.compile.screening_examples,
+            max_examples=screening_examples,
             fewshot_examples=fewshot_examples,
             parent_id=parent_id,
             edit_applied=edit_applied,
@@ -624,13 +640,26 @@ def _evaluate_candidates_multi_fidelity(
     narrowed: list[CandidateEvaluation] = []
     limit = max(config.compile.beam_width * 2, config.compile.min_structural_families)
     narrowing_pool = promising[:limit]
-    for candidate in (reporter.track(
+    narrowing_iterable = reporter.track(
         narrowing_pool,
         desc="Narrowing candidates",
         total=len(narrowing_pool),
         leave=False,
         level=1,
-    ) if reporter is not None else narrowing_pool):
+    ) if reporter is not None else narrowing_pool
+    for index, candidate in enumerate(narrowing_iterable):
+        narrowing_examples = _budgeted_stage_example_cap(
+            program=candidate.program,
+            phase="narrowing",
+            configured_examples=config.compile.narrowing_examples,
+            budget=budget,
+            remaining_candidates=len(narrowing_pool) - index,
+            config=config,
+        )
+        if narrowing_examples <= 0:
+            if reporter is not None:
+                reporter.log("Narrowing budget is exhausted before all promising candidates could be rescored.", level=1)
+            break
         narrowed_eval = _evaluate_candidate(
             program=candidate.program,
             task_spec=task_spec,
@@ -641,7 +670,7 @@ def _evaluate_candidates_multi_fidelity(
             budget=budget,
             phase="narrowing",
             stage="narrowing",
-            max_examples=config.compile.narrowing_examples,
+            max_examples=narrowing_examples,
             fewshot_examples=fewshot_examples,
             parent_id=candidate.parent_id,
             edit_applied=candidate.edit_applied,
@@ -703,6 +732,30 @@ def _estimate_program_invocations_per_example(program: PromptProgram, config: To
         else:
             invocations += 1
     return max(invocations, 1)
+
+
+def _budgeted_stage_example_cap(
+    *,
+    program: PromptProgram,
+    phase: str,
+    configured_examples: int,
+    budget: BudgetLedger | None,
+    remaining_candidates: int,
+    config: TopoPromptConfig,
+) -> int:
+    if configured_examples <= 0:
+        return 0
+    if budget is None:
+        return configured_examples
+    remaining_calls = budget.remaining(phase)
+    if remaining_calls <= 0 or remaining_candidates <= 0:
+        return 0
+    estimated_calls_per_example = _estimate_program_invocations_per_example(program, config)
+    if remaining_calls < estimated_calls_per_example:
+        return 0
+    fair_share_calls = max(estimated_calls_per_example, remaining_calls // remaining_candidates)
+    affordable_examples = max(1, fair_share_calls // estimated_calls_per_example)
+    return min(configured_examples, affordable_examples)
 
 
 def _estimate_confirmation_calls(

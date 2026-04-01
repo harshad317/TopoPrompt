@@ -103,6 +103,7 @@ class ObjectiveConfig(BaseModel):
     alpha_cost: float = 0.05
     beta_complexity: float = 0.10
     gamma_parse_failure: float = 0.20
+    delta_partial_coverage: float = 0.25
     epsilon_mode: str = "variance_adaptive"
     epsilon_floor: float = 0.01
     epsilon_z: float = 1.0
