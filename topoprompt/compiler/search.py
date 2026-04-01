@@ -369,7 +369,7 @@ def evaluate_program_on_examples(
     progress_verbosity: int = 1,
     progress_reporter: CompileProgressReporter | None = None,
 ) -> dict[str, Any]:
-    budget = BudgetLedger.from_compile_config(config.compile)
+    budget: BudgetLedger | None = None
     reporter = progress_reporter or CompileProgressReporter(enabled=show_progress, verbosity=progress_verbosity)
     reporter.rule(f"Evaluate Program: {program.program_id}", level=1, style="bold blue")
     evaluation = _evaluate_candidate(
@@ -466,7 +466,7 @@ def _evaluate_candidate(
     metric_fn: MetricFn,
     backend: LLMBackend,
     config: TopoPromptConfig,
-    budget: BudgetLedger,
+    budget: BudgetLedger | None,
     phase: str,
     stage: str,
     max_examples: int,
@@ -765,7 +765,7 @@ def _induce_route_diagnostics(
     metric_fn: MetricFn,
     backend: LLMBackend,
     config: TopoPromptConfig,
-    budget: BudgetLedger,
+    budget: BudgetLedger | None,
 ) -> list[RouteDiagnostic]:
     route_nodes = [node for node in program.nodes if node.node_type.value == "route" and node.route_spec]
     if not route_nodes:
@@ -786,7 +786,7 @@ def _induce_route_diagnostics(
             chosen_score = base_trace.correctness or 0.0
         branch_scores = {}
         for branch in route_node.route_spec.branch_labels:
-            if not budget.can_spend("reserve", 1):
+            if budget is not None and not budget.can_spend("reserve", 1):
                 break
             try:
                 forced = executor.run_program(
