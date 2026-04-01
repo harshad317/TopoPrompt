@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from topoprompt.compiler.seeds import instantiate_seed_program
+from topoprompt.eval.metrics import numeric_metric
 from topoprompt.runtime.executor import ProgramExecutor
 from topoprompt.runtime.parser import parse_structured_output
-from topoprompt.schemas import TaskAnalysis
+from topoprompt.schemas import Example, TaskAnalysis
 
 
 def test_runtime_executes_solve_verify_program(fake_backend, small_config, simple_task_spec, gsm8k_examples):
@@ -41,3 +42,12 @@ def test_parser_falls_back_to_repair(fake_backend):
     assert parsed["candidate_answer"] == "42"
     assert repair_used is False
 
+
+def test_gsm8k_metric_uses_final_answer_marker():
+    example = Example(
+        example_id="gsm8k_metric",
+        input={"question": "dummy"},
+        target="Some reasoning here.\n#### 72",
+    )
+    assert numeric_metric("72", example) == 1.0
+    assert numeric_metric("48", example) == 0.0

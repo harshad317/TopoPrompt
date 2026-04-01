@@ -28,7 +28,7 @@ def exact_match_metric(prediction: Any, example: Example) -> float:
 
 def numeric_metric(prediction: Any, example: Example) -> float:
     pred_value = _extract_number(prediction)
-    target_value = _extract_number(example.target)
+    target_value = _extract_reference_number(example.target)
     if pred_value is None or target_value is None:
         return exact_match_metric(prediction, example)
     return 1.0 if abs(pred_value - target_value) < 1e-9 else 0.0
@@ -76,3 +76,15 @@ def _extract_number(value: Any) -> float | None:
         return None
     return float(match.group(0))
 
+
+def _extract_reference_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value)
+    marker_match = re.search(r"####\s*(-?\d+(?:\.\d+)?)", text)
+    if marker_match:
+        return float(marker_match.group(1))
+    matches = re.findall(r"-?\d+(?:\.\d+)?", text)
+    if not matches:
+        return None
+    return float(matches[-1])
