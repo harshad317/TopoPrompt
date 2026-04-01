@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from topoprompt.compiler.search import compile_task, evaluate_program_on_examples
+from topoprompt.compiler.search import (
+    _select_affordable_confirmation_candidates,
+    _select_final_selection_pool,
+    compile_task,
+    evaluate_program_on_examples,
+)
 from topoprompt.compiler.seeds import instantiate_seed_program
+from topoprompt.config import TopoPromptConfig
+from topoprompt.eval.budget import BudgetLedger
 from topoprompt.eval.metrics import numeric_metric
-from topoprompt.schemas import Example, TaskAnalysis
+from topoprompt.schemas import CandidateEvaluation, Example, PromptProgram, TaskAnalysis
 
 
 def test_compile_task_runs_end_to_end(fake_backend, small_config, gsm8k_examples, tmp_path):
@@ -49,3 +56,146 @@ def test_evaluate_program_runs_full_dataset_without_compile_budget_cap(fake_back
     )
 
     assert len(result["traces"]) == len(examples)
+
+
+def test_final_selection_falls_back_to_beam_instead_of_screening_seed():
+    baseline_program = PromptProgram(
+        program_id="direct_finalize",
+        task_id="task",
+        nodes=[],
+        edges=[],
+        entry_node_id="entry",
+        finalize_node_id="finalize",
+    )
+    beam_program = PromptProgram(
+        program_id="plan_solve_finalize_best",
+        task_id="task",
+        nodes=[],
+        edges=[],
+        entry_node_id="entry",
+        finalize_node_id="finalize",
+    )
+    partial_confirmation_program = PromptProgram(
+        program_id="plan_solve_finalize_partial",
+        task_id="task",
+        nodes=[],
+        edges=[],
+        entry_node_id="entry",
+        finalize_node_id="finalize",
+    )
+
+    screening_seed = CandidateEvaluation(
+        program=baseline_program,
+        topology_fingerprint="seed",
+        family_signature="direct",
+        stage="screening",
+        score=0.375,
+        search_score=0.3592,
+        mean_invocations=1.0,
+        mean_tokens=390.0,
+        complexity=0.086,
+    )
+    beam_candidate = CandidateEvaluation(
+        program=beam_program,
+        topology_fingerprint="beam",
+        family_signature="plan-solve",
+        stage="narrowing",
+        score=0.875,
+        search_score=0.8610,
+        mean_invocations=2.0,
+        mean_tokens=799.0,
+        complexity=0.140,
+    )
+    partial_confirmation = CandidateEvaluation(
+        program=partial_confirmation_program,
+        topology_fingerprint="partial",
+        family_signature="plan-solve",
+        stage="confirmation",
+        score=0.900,
+        search_score=0.8800,
+        mean_invocations=2.0,
+        mean_tokens=810.0,
+        complexity=0.141,
+        metadata={"fully_evaluated": False, "examples_evaluated": 3, "target_examples": 12},
+    )
+
+    pool, used_fallback = _select_final_selection_pool(
+        finalists=[partial_confirmation],
+        beam=[beam_candidate],
+        seed_evals=[screening_seed],
+    )
+
+    assert used_fallback is True
+    assert [candidate.program.program_id for candidate in pool] == ["plan_solve_finalize_best"]
+
+
+def test_affordable_confirmation_selection_preserves_top_ranked_prefix(simple_task_spec):
+    config = TopoPromptConfig.model_validate(
+        {
+            "model": {"name": "fake-model", "repair_model": "fake-model"},
+            "compile": {
+                "confirmation_budget_calls": 12,
+                "reserve_budget_calls": 0,
+                "confirmation_examples": 4,
+            },
+            "runtime": {"cache_enabled": False},
+        }
+    )
+    analysis = TaskAnalysis(
+        needs_reasoning=True,
+        initial_seed_templates=["plan_solve_finalize", "solve_verify_finalize", "direct_finalize"],
+    )
+    plan_program = instantiate_seed_program(task_spec=simple_task_spec, analysis=analysis, template_name="plan_solve_finalize")
+    verify_program = instantiate_seed_program(task_spec=simple_task_spec, analysis=analysis, template_name="solve_verify_finalize")
+    direct_program = instantiate_seed_program(task_spec=simple_task_spec, analysis=analysis, template_name="direct_finalize")
+    assert plan_program is not None and verify_program is not None and direct_program is not None
+
+    candidates = [
+        CandidateEvaluation(
+            program=plan_program,
+            topology_fingerprint="plan",
+            family_signature="plan",
+            stage="narrowing",
+            score=0.8,
+            search_score=0.8,
+            mean_invocations=2.0,
+            mean_tokens=100.0,
+            complexity=0.1,
+        ),
+        CandidateEvaluation(
+            program=verify_program,
+            topology_fingerprint="verify",
+            family_signature="verify",
+            stage="narrowing",
+            score=0.79,
+            search_score=0.79,
+            mean_invocations=2.0,
+            mean_tokens=110.0,
+            complexity=0.11,
+        ),
+        CandidateEvaluation(
+            program=direct_program,
+            topology_fingerprint="direct",
+            family_signature="direct",
+            stage="narrowing",
+            score=0.7,
+            search_score=0.7,
+            mean_invocations=1.0,
+            mean_tokens=80.0,
+            complexity=0.08,
+        ),
+    ]
+    validation_examples = [
+        Example(example_id=f"v{index}", input={"question": f"What is {index} + 1?"}, target=str(index + 1))
+        for index in range(4)
+    ]
+    budget = BudgetLedger.from_compile_config(config.compile)
+
+    selected = _select_affordable_confirmation_candidates(
+        candidates=candidates,
+        validation_examples=validation_examples,
+        budget=budget,
+        config=config,
+    )
+
+    assert [candidate.program.program_id for candidate in selected] == ["plan_solve_finalize"]

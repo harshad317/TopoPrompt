@@ -186,7 +186,6 @@ def compile_task(
     archive_records = [_archive_record(candidate, round_index=0) for candidate in seed_evals]
     compile_traces = [trace for candidate in seed_evals for trace in candidate.traces]
     beam = _select_diverse_beam(seed_evals, width=config.compile.beam_width, min_families=config.compile.min_structural_families)
-    confirmed_archive: list[CandidateEvaluation] = []
     beam_family_count_by_round = [len({candidate.family_signature for candidate in beam})] if beam else [0]
     best_beam_score = max((candidate.search_score for candidate in beam), default=0.0)
     stale_rounds = 0
@@ -263,20 +262,6 @@ def compile_task(
 
         leader = beam[0]
         reporter.log_candidate(leader, prefix=f"Round {round_index} leader ", level=1)
-        best_confirmed = max((candidate.score for candidate in confirmed_archive), default=-1.0)
-        if leader.score >= best_confirmed + config.compile.early_stop_min_improvement and budget.remaining("confirmation") > 0:
-            confirmed = _confirm_candidates(
-                candidates=[leader],
-                task_spec=task_spec,
-                validation_examples=partitions.validation_examples,
-                metric_fn=metric_fn,
-                backend=backend,
-                config=config,
-                budget=budget,
-                reporter=reporter,
-            )
-            confirmed_archive.extend(confirmed)
-            compile_traces.extend(trace for candidate in confirmed for trace in candidate.traces)
 
         current_best = max(candidate.search_score for candidate in beam)
         if current_best < best_beam_score + config.compile.early_stop_min_improvement:
@@ -293,8 +278,15 @@ def compile_task(
             reporter.log("Search budgets exhausted; stopping.")
             break
 
-    finalists = _confirm_candidates(
+    final_confirmation_candidates = _select_affordable_confirmation_candidates(
         candidates=beam[: config.compile.confirm_top_k],
+        validation_examples=partitions.validation_examples,
+        budget=budget,
+        config=config,
+        reporter=reporter,
+    )
+    finalists = _confirm_candidates(
+        candidates=final_confirmation_candidates,
         task_spec=task_spec,
         validation_examples=partitions.validation_examples,
         metric_fn=metric_fn,
@@ -304,17 +296,27 @@ def compile_task(
         reporter=reporter,
     )
     compile_traces.extend(trace for candidate in finalists for trace in candidate.traces)
-    confirmed_candidates = _dedupe_confirmed(finalists + confirmed_archive + seed_evals[:1])
-    if not confirmed_candidates:
-        confirmed_candidates = seed_evals
+    selection_candidates, used_search_fallback = _select_final_selection_pool(
+        finalists=finalists,
+        beam=beam,
+        seed_evals=seed_evals,
+    )
     best_candidate, smallest_effective, epsilon, _effective = choose_smallest_effective(
-        confirmed_candidates,
+        selection_candidates,
         objective_config=config.objective,
     )
     route_accuracy, route_regret = aggregate_route_metrics(smallest_effective.traces)
     reporter.rule("Final Selection", level=1, style="bold green")
-    reporter.log_candidate(best_candidate, prefix="Best confirmed ", level=1)
-    reporter.log_candidate(smallest_effective, prefix="Smallest effective ", level=1)
+    if used_search_fallback:
+        reporter.log(
+            "No candidates completed final confirmation. Falling back to the strongest search-stage candidates.",
+        )
+    reporter.log_candidate(best_candidate, prefix="Best fallback " if used_search_fallback else "Best confirmed ", level=1)
+    reporter.log_candidate(
+        smallest_effective,
+        prefix="Smallest fallback " if used_search_fallback else "Smallest effective ",
+        level=1,
+    )
     reporter.log(f"epsilon={epsilon:.4f} route_accuracy={route_accuracy} route_regret={route_regret}")
 
     metrics = CompileMetrics(
@@ -502,10 +504,16 @@ def _evaluate_candidate(
                 invocations=trace.total_invocations,
                 parse_failures=trace.parse_failures,
             )
+    fully_evaluated = len(traces) == len(scoped_examples)
     if not traces:
         if reporter is not None:
             reporter.log(f"{program.program_id} produced no traces during {stage}.")
         return None
+    if reporter is not None and not fully_evaluated:
+        reporter.log(
+            f"{program.program_id} completed {len(traces)}/{len(scoped_examples)} examples during {stage}; budget exhausted.",
+            level=1,
+        )
 
     route_diagnostics = _induce_route_diagnostics(
         program=program,
@@ -552,7 +560,12 @@ def _evaluate_candidate(
         parse_failure_rate=parse_failure_rate,
         traces=traces,
         route_diagnostics=route_diagnostics,
-        metadata={"fewshot_pool_size": len(fewshot_examples)},
+        metadata={
+            "fewshot_pool_size": len(fewshot_examples),
+            "examples_evaluated": len(traces),
+            "target_examples": len(scoped_examples),
+            "fully_evaluated": fully_evaluated,
+        },
     )
     if reporter is not None:
         reporter.log_candidate(candidate, prefix=f"{stage} ", level=2)
@@ -676,6 +689,95 @@ def _confirm_candidates(
         if evaluation is not None:
             confirmed.append(evaluation)
     return confirmed
+
+
+def _estimate_program_invocations_per_example(program: PromptProgram, config: TopoPromptConfig) -> int:
+    invocations = 0
+    for node in program.nodes:
+        if node.execution_mode == "pass_through":
+            continue
+        if node.execution_mode == "decompose_macro":
+            invocations += 1 + config.program.max_subquestions_per_decompose
+        else:
+            invocations += 1
+    return max(invocations, 1)
+
+
+def _estimate_confirmation_calls(
+    *,
+    program: PromptProgram,
+    validation_examples: list[Example],
+    config: TopoPromptConfig,
+) -> int:
+    target_examples = min(len(validation_examples), config.compile.confirmation_examples)
+    return _estimate_program_invocations_per_example(program, config) * target_examples
+
+
+def _select_affordable_confirmation_candidates(
+    *,
+    candidates: list[CandidateEvaluation],
+    validation_examples: list[Example],
+    budget: BudgetLedger,
+    config: TopoPromptConfig,
+    reporter: CompileProgressReporter | None = None,
+) -> list[CandidateEvaluation]:
+    if not candidates or not validation_examples:
+        return []
+    available_calls = budget.remaining("confirmation") + budget.remaining("reserve")
+    if available_calls <= 0:
+        if reporter is not None:
+            reporter.log("No confirmation budget remains for final selection.")
+        return []
+
+    selected: list[CandidateEvaluation] = []
+    reserved_calls = 0
+    for index, candidate in enumerate(candidates):
+        estimated_calls = _estimate_confirmation_calls(
+            program=candidate.program,
+            validation_examples=validation_examples,
+            config=config,
+        )
+        remaining_calls = available_calls - reserved_calls
+        if estimated_calls <= remaining_calls:
+            selected.append(candidate)
+            reserved_calls += estimated_calls
+            continue
+        if index == 0:
+            selected.append(candidate)
+            if reporter is not None:
+                reporter.log(
+                    (
+                        f"Confirmation budget is tight; attempting only the top candidate "
+                        f"{candidate.program.program_id} (est_calls={estimated_calls}, available={available_calls})."
+                    ),
+                )
+        elif reporter is not None:
+            reporter.log(
+                (
+                    f"Stopping final confirmation at {candidate.program.program_id}; "
+                    f"est_calls={estimated_calls} remaining={remaining_calls}."
+                ),
+                level=1,
+            )
+        break
+    return selected
+
+
+def _is_fully_evaluated(candidate: CandidateEvaluation) -> bool:
+    return bool(candidate.metadata.get("fully_evaluated", False))
+
+
+def _select_final_selection_pool(
+    *,
+    finalists: list[CandidateEvaluation],
+    beam: list[CandidateEvaluation],
+    seed_evals: list[CandidateEvaluation],
+) -> tuple[list[CandidateEvaluation], bool]:
+    fully_confirmed = _dedupe_confirmed([candidate for candidate in finalists if _is_fully_evaluated(candidate)])
+    if fully_confirmed:
+        return fully_confirmed, False
+    fallback_pool = beam or finalists or seed_evals
+    return fallback_pool, True
 
 
 def _select_diverse_beam(candidates: list[CandidateEvaluation], *, width: int, min_families: int) -> list[CandidateEvaluation]:
