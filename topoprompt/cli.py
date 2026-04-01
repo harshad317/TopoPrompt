@@ -24,6 +24,8 @@ def main() -> None:
     compile_parser.add_argument("--output-dir", required=True)
     compile_parser.add_argument("--metric", default="exact_match")
     compile_parser.add_argument("--fake-backend", action="store_true")
+    compile_parser.add_argument("--quiet", action="store_true")
+    compile_parser.add_argument("-v", "--verbose", action="count", default=0)
 
     evaluate_parser = subparsers.add_parser("evaluate")
     evaluate_parser.add_argument("--program", required=True)
@@ -32,6 +34,8 @@ def main() -> None:
     evaluate_parser.add_argument("--config", default=None)
     evaluate_parser.add_argument("--metric", default="exact_match")
     evaluate_parser.add_argument("--fake-backend", action="store_true")
+    evaluate_parser.add_argument("--quiet", action="store_true")
+    evaluate_parser.add_argument("-v", "--verbose", action="count", default=0)
 
     args = parser.parse_args()
     config = load_config(args.config)
@@ -47,6 +51,8 @@ def main() -> None:
             backend=backend,
             config=config,
             output_dir=args.output_dir,
+            show_progress=not args.quiet,
+            progress_verbosity=1 + int(args.verbose or 0),
         )
         print(json.dumps(artifact.metrics.model_dump(mode="json"), indent=2))
         return
@@ -71,10 +77,11 @@ def main() -> None:
             backend=backend,
             config=config,
             phase="confirmation",
+            show_progress=not args.quiet,
+            progress_verbosity=1 + int(args.verbose or 0),
         )
         print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
     main()
-

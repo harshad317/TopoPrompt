@@ -20,6 +20,7 @@ from topoprompt.eval.budget import BudgetLedger
 from topoprompt.eval.datasets import DatasetPartitions, partition_examples
 from topoprompt.eval.metrics import MetricFn, metric_for_name
 from topoprompt.ir import family_signature, topology_fingerprint
+from topoprompt.progress import CompileProgressReporter
 from topoprompt.runtime.executor import BudgetExhausted, ProgramExecutor
 from topoprompt.runtime.trace import aggregate_route_metrics
 from topoprompt.schemas import (
@@ -53,6 +54,9 @@ def compile_task(
     search_examples: list[Example] | None = None,
     validation_examples: list[Example] | None = None,
     fewshot_examples: list[Example] | None = None,
+    show_progress: bool = False,
+    progress_verbosity: int = 1,
+    progress_reporter: CompileProgressReporter | None = None,
 ) -> CompileArtifact:
     if config is None:
         overrides: dict[str, Any] = {}
@@ -69,6 +73,7 @@ def compile_task(
             config.compile.total_budget_calls = compile_budget
 
     backend = backend or OpenAIBackend()
+    reporter = progress_reporter or CompileProgressReporter(enabled=show_progress, verbosity=progress_verbosity)
     metric_name, metric_fn = _resolve_metric(metric)
     partitions = _resolve_partitions(
         examples=examples,
@@ -80,9 +85,30 @@ def compile_task(
     task_spec = _infer_task_spec(task_description=task_description, examples=examples, task_id=task_id)
     budget = BudgetLedger.from_compile_config(config.compile)
     trace_store = TraceStore(Path(output_dir) / "transfer_trace_store.jsonl" if output_dir else None)
+    reporter.rule(f"TopoPrompt Compile: {task_spec.task_id}")
+    reporter.log(
+        (
+            f"metric={metric_name} examples={len(examples)} "
+            f"fewshot={len(partitions.fewshot_examples)} "
+            f"search={len(partitions.search_examples)} "
+            f"validation={len(partitions.validation_examples)}"
+        ),
+        style="cyan",
+    )
+    reporter.log_budget(spent=budget.spent_total(), planned=budget.planned_total(), phase="compile")
 
-    analysis = _run_analysis(task_spec=task_spec, examples=partitions.search_examples, metric_name=metric_name, backend=backend, config=config, budget=budget)
+    analysis = _run_analysis(
+        task_spec=task_spec,
+        examples=partitions.search_examples,
+        metric_name=metric_name,
+        backend=backend,
+        config=config,
+        budget=budget,
+        reporter=reporter,
+    )
+    reporter.print_analysis(analysis)
     seed_names = (analysis.initial_seed_templates or SEED_LIBRARY)[:5]
+    reporter.log(f"Selected seed templates: {', '.join(seed_names)}", style="magenta")
     seed_programs = instantiate_seed_programs(
         task_spec=task_spec,
         analysis=analysis,
@@ -90,9 +116,17 @@ def compile_task(
         seed_names=seed_names,
     )
     seed_programs = [program for program in seed_programs if _validate_candidate(program, config)]
+    reporter.log(f"Valid instantiated seeds: {len(seed_programs)}", style="cyan")
 
-    seed_evals = [
-        _evaluate_candidate(
+    seed_evals = []
+    for program in reporter.track(
+        seed_programs,
+        desc="Seed evaluation",
+        total=len(seed_programs),
+        leave=False,
+        level=1,
+    ):
+        evaluation = _evaluate_candidate(
             program=program,
             task_spec=task_spec,
             examples=partitions.search_examples,
@@ -104,14 +138,19 @@ def compile_task(
             stage="screening",
             max_examples=config.compile.screening_examples,
             fewshot_examples=partitions.fewshot_examples,
+            reporter=reporter,
         )
-        for program in seed_programs
-    ]
+        if evaluation is not None:
+            seed_evals.append(evaluation)
     seed_evals = [evaluation for evaluation in seed_evals if evaluation is not None]
 
     direct_baseline = next((evaluation for evaluation in seed_evals if evaluation.program.program_id == "direct_finalize"), None)
     best_non_direct = max((evaluation.score for evaluation in seed_evals if evaluation.program.program_id != "direct_finalize"), default=0.0)
     if direct_baseline is not None and best_non_direct < direct_baseline.score - config.compile.reseed_margin:
+        reporter.log(
+            "Analyzer-ranked seeds underperformed the direct baseline. Re-seeding from the full library.",
+            style="yellow",
+        )
         seed_programs = instantiate_seed_programs(
             task_spec=task_spec,
             analysis=analysis,
@@ -119,8 +158,15 @@ def compile_task(
             seed_names=SEED_LIBRARY,
         )
         seed_programs = [program for program in seed_programs if _validate_candidate(program, config)]
-        seed_evals = [
-            _evaluate_candidate(
+        seed_evals = []
+        for program in reporter.track(
+            seed_programs,
+            desc="Re-seed evaluation",
+            total=len(seed_programs),
+            leave=False,
+            level=1,
+        ):
+            evaluation = _evaluate_candidate(
                 program=program,
                 task_spec=task_spec,
                 examples=partitions.search_examples,
@@ -132,9 +178,10 @@ def compile_task(
                 stage="screening",
                 max_examples=config.compile.screening_examples,
                 fewshot_examples=partitions.fewshot_examples,
+                reporter=reporter,
             )
-            for program in seed_programs
-        ]
+            if evaluation is not None:
+                seed_evals.append(evaluation)
         seed_evals = [evaluation for evaluation in seed_evals if evaluation is not None]
 
     archive_records = [_archive_record(candidate, round_index=0) for candidate in seed_evals]
@@ -146,8 +193,20 @@ def compile_task(
     stale_rounds = 0
 
     for round_index in range(1, config.compile.max_rounds + 1):
+        reporter.rule(f"Search Round {round_index}", level=1, style="bold blue")
+        reporter.log(
+            f"beam_size={len(beam)} beam_families={len({candidate.family_signature for candidate in beam})}",
+            style="cyan",
+        )
+        reporter.log_budget(spent=budget.spent_total(), planned=budget.planned_total(), phase="compile")
         proposals: list[tuple[PromptProgram, str, str]] = []
-        for parent in beam:
+        for parent in reporter.track(
+            beam,
+            desc=f"Round {round_index}: propose edits",
+            total=len(beam),
+            leave=False,
+            level=1,
+        ):
             edits = generate_heuristic_edits(program=parent.program, analysis=analysis, config=config)
             if config.compile.llm_edit_proposals_enabled:
                 edits.extend(
@@ -173,7 +232,9 @@ def compile_task(
                     continue
 
         proposals = _dedupe_proposals(proposals)
+        reporter.log(f"Round {round_index}: {len(proposals)} unique valid proposals", style="magenta")
         if not proposals:
+            reporter.log(f"Round {round_index}: no proposals survived validation; stopping.", style="yellow")
             break
 
         scored = _evaluate_candidates_multi_fidelity(
@@ -185,8 +246,10 @@ def compile_task(
             config=config,
             budget=budget,
             fewshot_examples=partitions.fewshot_examples,
+            reporter=reporter,
         )
         if not scored:
+            reporter.log(f"Round {round_index}: no candidates survived evaluation; stopping.", style="yellow")
             break
 
         for candidate in scored:
@@ -197,9 +260,11 @@ def compile_task(
         beam = _select_diverse_beam(scored, width=config.compile.beam_width, min_families=config.compile.min_structural_families)
         beam_family_count_by_round.append(len({candidate.family_signature for candidate in beam}))
         if not beam:
+            reporter.log(f"Round {round_index}: beam collapsed to empty; stopping.", style="yellow")
             break
 
         leader = beam[0]
+        reporter.log_candidate(leader, prefix=f"Round {round_index} leader ", level=1)
         best_confirmed = max((candidate.score for candidate in confirmed_archive), default=-1.0)
         if leader.score >= best_confirmed + config.compile.early_stop_min_improvement and budget.remaining("confirmation") > 0:
             confirmed = _confirm_candidates(
@@ -210,6 +275,7 @@ def compile_task(
                 backend=backend,
                 config=config,
                 budget=budget,
+                reporter=reporter,
             )
             confirmed_archive.extend(confirmed)
             compile_traces.extend(trace for candidate in confirmed for trace in candidate.traces)
@@ -221,8 +287,13 @@ def compile_task(
             best_beam_score = current_best
             stale_rounds = 0
         if stale_rounds >= config.compile.early_stop_patience_rounds:
+            reporter.log(
+                f"Round {round_index}: early stop patience reached with no meaningful improvement.",
+                style="yellow",
+            )
             break
         if budget.remaining("confirmation") <= 0 and budget.remaining("screening") <= 0 and budget.remaining("narrowing") <= 0:
+            reporter.log("Search budgets exhausted; stopping.", style="yellow")
             break
 
     finalists = _confirm_candidates(
@@ -233,6 +304,7 @@ def compile_task(
         backend=backend,
         config=config,
         budget=budget,
+        reporter=reporter,
     )
     compile_traces.extend(trace for candidate in finalists for trace in candidate.traces)
     confirmed_candidates = _dedupe_confirmed(finalists + confirmed_archive + seed_evals[:1])
@@ -243,6 +315,10 @@ def compile_task(
         objective_config=config.objective,
     )
     route_accuracy, route_regret = aggregate_route_metrics(smallest_effective.traces)
+    reporter.rule("Final Selection", level=1, style="bold green")
+    reporter.log_candidate(best_candidate, prefix="Best confirmed ", level=1)
+    reporter.log_candidate(smallest_effective, prefix="Smallest effective ", level=1)
+    reporter.log(f"epsilon={epsilon:.4f} route_accuracy={route_accuracy} route_regret={route_regret}", style="green")
 
     metrics = CompileMetrics(
         best_program_id=best_candidate.program.program_id,
@@ -279,6 +355,7 @@ def compile_task(
     if output_dir is not None:
         write_compile_artifact(artifact, output_dir)
         trace_store.flush()
+        reporter.log(f"Artifacts written to {output_dir}", style="cyan")
     return artifact
 
 
@@ -291,8 +368,13 @@ def evaluate_program_on_examples(
     backend: LLMBackend,
     config: TopoPromptConfig,
     phase: str,
+    show_progress: bool = False,
+    progress_verbosity: int = 1,
+    progress_reporter: CompileProgressReporter | None = None,
 ) -> dict[str, Any]:
     budget = BudgetLedger.from_compile_config(config.compile)
+    reporter = progress_reporter or CompileProgressReporter(enabled=show_progress, verbosity=progress_verbosity)
+    reporter.rule(f"Evaluate Program: {program.program_id}", level=1, style="bold blue")
     evaluation = _evaluate_candidate(
         program=program,
         task_spec=task_spec,
@@ -305,8 +387,10 @@ def evaluate_program_on_examples(
         stage=phase,
         max_examples=len(examples),
         fewshot_examples=[],
+        reporter=reporter,
     )
     assert evaluation is not None
+    reporter.log_candidate(evaluation, prefix="Evaluation ", level=1)
     return {
         "score": evaluation.score,
         "mean_invocations": evaluation.mean_invocations,
@@ -364,9 +448,14 @@ def _run_analysis(
     backend: LLMBackend,
     config: TopoPromptConfig,
     budget: BudgetLedger,
+    reporter: CompileProgressReporter | None = None,
 ) -> TaskAnalysis:
     if not budget.spend("analyzer", 1, allow_reserve=True):
+        if reporter is not None:
+            reporter.log("Analyzer budget unavailable. Falling back to direct seed.", style="yellow")
         return TaskAnalysis(initial_seed_templates=["direct_finalize"])
+    if reporter is not None:
+        reporter.log(f"Running task analyzer on {min(len(examples), config.data.representative_examples_for_analysis)} representative examples.", style="cyan")
     analysis = analyze_task(task_spec=task_spec, examples=examples, metric_name=metric_name, backend=backend, config=config)
     task_spec.task_family = analysis.task_family
     return analysis
@@ -387,11 +476,19 @@ def _evaluate_candidate(
     fewshot_examples: list[Example],
     parent_id: str | None = None,
     edit_applied: str | None = None,
+    reporter: CompileProgressReporter | None = None,
 ) -> CandidateEvaluation | None:
-    executor = ProgramExecutor(backend=backend, config=config, budget_ledger=budget)
+    executor = ProgramExecutor(backend=backend, config=config, budget_ledger=budget, reporter=reporter)
     traces = []
     scores = []
-    for example in examples[:max_examples]:
+    scoped_examples = examples[:max_examples]
+    for example in (reporter.track(
+        scoped_examples,
+        desc=f"{stage}: {program.program_id}",
+        total=len(scoped_examples),
+        leave=False,
+        level=2,
+    ) if reporter is not None else scoped_examples):
         try:
             result = executor.run_program(
                 program=program,
@@ -406,7 +503,17 @@ def _evaluate_candidate(
         trace.correctness = metric_fn(trace.final_output, example)
         traces.append(trace)
         scores.append(trace.correctness)
+        if reporter is not None:
+            reporter.log_example_result(
+                program_id=program.program_id,
+                example_id=example.example_id,
+                score=trace.correctness,
+                invocations=trace.total_invocations,
+                parse_failures=trace.parse_failures,
+            )
     if not traces:
+        if reporter is not None:
+            reporter.log(f"{program.program_id} produced no traces during {stage}.", style="yellow")
         return None
 
     route_diagnostics = _induce_route_diagnostics(
@@ -456,6 +563,8 @@ def _evaluate_candidate(
         route_diagnostics=route_diagnostics,
         metadata={"fewshot_pool_size": len(fewshot_examples)},
     )
+    if reporter is not None:
+        reporter.log_candidate(candidate, prefix=f"{stage} ", level=1)
     return candidate
 
 
@@ -469,9 +578,16 @@ def _evaluate_candidates_multi_fidelity(
     config: TopoPromptConfig,
     budget: BudgetLedger,
     fewshot_examples: list[Example],
+    reporter: CompileProgressReporter | None = None,
 ) -> list[CandidateEvaluation]:
     screened: list[CandidateEvaluation] = []
-    for program, parent_id, edit_applied in proposals:
+    for program, parent_id, edit_applied in (reporter.track(
+        proposals,
+        desc="Screening candidates",
+        total=len(proposals),
+        leave=False,
+        level=1,
+    ) if reporter is not None else proposals):
         evaluation = _evaluate_candidate(
             program=program,
             task_spec=task_spec,
@@ -486,6 +602,7 @@ def _evaluate_candidates_multi_fidelity(
             fewshot_examples=fewshot_examples,
             parent_id=parent_id,
             edit_applied=edit_applied,
+            reporter=reporter,
         )
         if evaluation is not None:
             screened.append(evaluation)
@@ -500,7 +617,14 @@ def _evaluate_candidates_multi_fidelity(
     promising = sorted(promising, key=lambda item: item.search_score, reverse=True)
     narrowed: list[CandidateEvaluation] = []
     limit = max(config.compile.beam_width * 2, config.compile.min_structural_families)
-    for candidate in promising[:limit]:
+    narrowing_pool = promising[:limit]
+    for candidate in (reporter.track(
+        narrowing_pool,
+        desc="Narrowing candidates",
+        total=len(narrowing_pool),
+        leave=False,
+        level=1,
+    ) if reporter is not None else narrowing_pool):
         narrowed_eval = _evaluate_candidate(
             program=candidate.program,
             task_spec=task_spec,
@@ -515,6 +639,7 @@ def _evaluate_candidates_multi_fidelity(
             fewshot_examples=fewshot_examples,
             parent_id=candidate.parent_id,
             edit_applied=candidate.edit_applied,
+            reporter=reporter,
         )
         if narrowed_eval is not None:
             narrowed.append(narrowed_eval)
@@ -530,9 +655,17 @@ def _confirm_candidates(
     backend: LLMBackend,
     config: TopoPromptConfig,
     budget: BudgetLedger,
+    reporter: CompileProgressReporter | None = None,
 ) -> list[CandidateEvaluation]:
     confirmed: list[CandidateEvaluation] = []
-    for candidate in sorted(candidates, key=lambda item: item.search_score, reverse=True):
+    ranked_candidates = sorted(candidates, key=lambda item: item.search_score, reverse=True)
+    for candidate in (reporter.track(
+        ranked_candidates,
+        desc="Confirmation",
+        total=len(ranked_candidates),
+        leave=False,
+        level=1,
+    ) if reporter is not None else ranked_candidates):
         evaluation = _evaluate_candidate(
             program=candidate.program,
             task_spec=task_spec,
@@ -547,6 +680,7 @@ def _confirm_candidates(
             fewshot_examples=[],
             parent_id=candidate.parent_id,
             edit_applied=candidate.edit_applied,
+            reporter=reporter,
         )
         if evaluation is not None:
             confirmed.append(evaluation)
@@ -770,4 +904,3 @@ def _validate_candidate(program: PromptProgram, config: TopoPromptConfig) -> boo
         return True
     except ProgramValidationError:
         return False
-

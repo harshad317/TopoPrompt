@@ -9,6 +9,7 @@ from topoprompt.backends.llm_client import LLMBackend
 from topoprompt.config import TopoPromptConfig
 from topoprompt.eval.budget import BudgetLedger
 from topoprompt.ir import outgoing_edges, topological_nodes
+from topoprompt.progress import CompileProgressReporter
 from topoprompt.runtime.cache import RuntimeCache
 from topoprompt.runtime.parser import ParseFailed, parse_structured_output
 from topoprompt.runtime.renderer import render_node_prompt
@@ -34,10 +35,12 @@ class ProgramExecutor:
         config: TopoPromptConfig,
         budget_ledger: BudgetLedger | None = None,
         cache: RuntimeCache | None = None,
+        reporter: CompileProgressReporter | None = None,
     ) -> None:
         self.backend = backend
         self.config = config
         self.budget_ledger = budget_ledger
+        self.reporter = reporter
         self.cache = cache or (
             RuntimeCache(Path(self.config.runtime.cache_dir)) if self.config.runtime.cache_enabled else None
         )
@@ -64,12 +67,38 @@ class ProgramExecutor:
                 raise RuntimeError(f"Loop detected at node {current_node_id}")
             visited.add(current_node_id)
             node = nodes[current_node_id]
+            if self.reporter is not None:
+                self.reporter.log_node_event(
+                    program_id=program.program_id,
+                    example_id=example_id,
+                    node_id=node.node_id,
+                    node_type=node.node_type.value,
+                )
             if node.execution_mode == "pass_through":
-                trace = self._execute_pass_through(node=node, state=state)
+                trace = self._execute_pass_through(
+                    program_id=program.program_id,
+                    example_id=example_id,
+                    node=node,
+                    state=state,
+                )
             elif node.execution_mode == "decompose_macro":
-                trace = self._execute_decompose(node=node, task_spec=task_spec, state=state, phase=phase)
+                trace = self._execute_decompose(
+                    program_id=program.program_id,
+                    example_id=example_id,
+                    node=node,
+                    task_spec=task_spec,
+                    state=state,
+                    phase=phase,
+                )
             else:
-                trace = self._execute_llm_node(node=node, task_spec=task_spec, state=state, phase=phase)
+                trace = self._execute_llm_node(
+                    program_id=program.program_id,
+                    example_id=example_id,
+                    node=node,
+                    task_spec=task_spec,
+                    state=state,
+                    phase=phase,
+                )
             node_traces.append(trace)
 
             if isinstance(trace.parsed_output, dict):
@@ -98,6 +127,14 @@ class ProgramExecutor:
                     branch, confidence = resolve_route_choice(route_spec, trace.parsed_output or {})
                 trace.route_choice = branch
                 trace.confidence = confidence
+                if self.reporter is not None:
+                    self.reporter.log_node_event(
+                        program_id=program.program_id,
+                        example_id=example_id,
+                        node_id=node.node_id,
+                        node_type=node.node_type.value,
+                        route_choice=branch,
+                    )
                 next_edges = [edge for edge in next_edges if edge.label == branch] or next_edges
 
             if not next_edges:
@@ -119,7 +156,14 @@ class ProgramExecutor:
         )
         return ExecutionResult(state=state, trace=program_trace)
 
-    def _execute_pass_through(self, *, node: ProgramNode, state: dict[str, Any]) -> NodeExecutionTrace:
+    def _execute_pass_through(
+        self,
+        *,
+        program_id: str,
+        example_id: str,
+        node: ProgramNode,
+        state: dict[str, Any],
+    ) -> NodeExecutionTrace:
         parsed_output: dict[str, Any]
         if node.node_type == NodeType.FINALIZE:
             source_key = node.config.get("source_key")
@@ -147,12 +191,21 @@ class ProgramExecutor:
     def _execute_decompose(
         self,
         *,
+        program_id: str,
+        example_id: str,
         node: ProgramNode,
         task_spec: TaskSpec,
         state: dict[str, Any],
         phase: str,
     ) -> NodeExecutionTrace:
-        trace = self._execute_llm_node(node=node, task_spec=task_spec, state=state, phase=phase)
+        trace = self._execute_llm_node(
+            program_id=program_id,
+            example_id=example_id,
+            node=node,
+            task_spec=task_spec,
+            state=state,
+            phase=phase,
+        )
         parsed = trace.parsed_output or {}
         subquestions = list(parsed.get("subquestions") or [])[: self.config.program.max_subquestions_per_decompose]
         subanswers: list[str] = []
@@ -181,6 +234,8 @@ class ProgramExecutor:
     def _execute_llm_node(
         self,
         *,
+        program_id: str,
+        example_id: str,
         node: ProgramNode,
         task_spec: TaskSpec,
         state: dict[str, Any],
@@ -229,6 +284,14 @@ class ProgramExecutor:
         except ParseFailed as exc:
             parsed_output = None
             repair_used = False
+            if self.reporter is not None:
+                self.reporter.log_node_event(
+                    program_id=program_id,
+                    example_id=example_id,
+                    node_id=node.node_id,
+                    node_type=node.node_type.value,
+                    parse_error=str(exc),
+                )
             return NodeExecutionTrace(
                 node_id=node.node_id,
                 prompt_text=user_prompt,
@@ -264,4 +327,3 @@ class ProgramExecutor:
         allow_reserve = phase in {"confirmation", "analyzer"}
         if not self.budget_ledger.spend(phase, calls, allow_reserve=allow_reserve):
             raise BudgetExhausted(f"Budget exhausted for phase '{phase}'")
-
