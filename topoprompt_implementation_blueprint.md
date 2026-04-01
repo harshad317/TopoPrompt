@@ -151,14 +151,18 @@ This makes the system publishable and buildable.
 Let:
 
 - `T` be a task specification in natural language
-- `E_dev` be a small development set of labeled examples
+- `E_compile` be the compile partition
+- `E_fs` be the fixed few-shot pool carved out of `E_compile`
+- `E_search` be the search partition, where `E_search = E_compile \ E_fs`
+- `E_val` be the held-out validation partition used for finalist confirmation and minimality selection
+- `E_test` be the held-out test partition used only for final reporting
 - `M` be a black-box LLM API
-- `B` be a compile-time budget
+- `B_call` be the compile-time budget measured in **single LLM invocations**
 - `P` be a prompt program
 
 We want to find:
 
-`P* = argmax_P Utility(P | T, E_dev, M, B)`
+`P* = argmax_P Utility(P | T, E_search, E_val, M, B_call)`
 
 Where:
 
@@ -166,9 +170,31 @@ Where:
 
 Use:
 
-- `Perf(P)` = task metric on the dev set
+- `Perf(P)` = task metric on `E_val`
 - `Cost(P)` = compile-time and inference-time cost
 - `Complexity(P)` = description length or structural complexity
+
+### 6.0.1 Canonical budget unit
+
+The canonical compile budget unit in TopoPrompt is **one backend LLM invocation**.
+
+That means:
+
+- one node execution with `execution_mode = llm_call` costs `1`
+- one parser-repair call costs `1`
+- one analyzer call costs `1`
+- one route call costs `1`
+- one decompose subquestion solve subcall costs `1`
+
+Candidate evaluation cost is therefore variable.
+
+Recommended V1 accounting rule:
+
+`EvalCost(P, X) = sum_{x in X} Invocations(P, x) + RepairCalls(P, x)`
+
+Where `Invocations(P, x)` is the number of actual model calls made when running program `P` on example `x`.
+
+This is why `screening_examples`, `narrowing_examples`, and `confirmation_examples` should be treated as **upper bounds on examples evaluated**, not guaranteed counts. The scheduler must stop evaluating a candidate shard when the remaining LLM-call budget would be exceeded.
 
 ### 6.1 Recommended selection rule
 
@@ -288,6 +314,13 @@ artifact = compile_task(
 )
 ```
 
+Canonical ownership rule:
+
+- if the caller provides only `examples`, `compile_task` is responsible for partitioning them into `E_fs`, `E_search`, and `E_val` using the configured split policy
+- if the caller provides explicit partitions, the compiler must use those partitions as-is and skip internal repartitioning
+
+This makes `E_fs` compiler-owned by default and removes ambiguity about who materializes the few-shot pool.
+
 Output:
 
 - `artifact.program_ir`
@@ -362,9 +395,24 @@ For V1:
 
 This avoids confusing implementers into thinking `critique` is mandatory in the first prototype.
 
+### 9.3.2 V1 core runtime vs late-V1 nodes
+
+For implementation sequencing, distinguish between:
+
+- **V1 core runtime nodes**: `direct`, `solve`, `verify`, `route`, `finalize`
+- **late-V1 extension nodes**: `plan`, `decompose`, `format`
+- **V1.5 node**: `critique`
+
+This keeps Phase 1 small while still allowing `plan`, `decompose`, and `format` to join the full V1 compiler once the core runtime is stable.
+
+Recommended V1 handling of formatting:
+
+- use prompt modules and `finalize` for most formatting behavior in the MVP
+- add standalone `format` nodes only after the core runtime and selector are stable
+
 ### 9.4 Node semantics
 
-- `direct`: answer in one pass
+- `direct`: produce a candidate answer in one pass without explicit planning
 - `plan`: produce a concise plan before solving
 - `decompose`: break the task into subparts or subquestions
 - `solve`: produce an intermediate or final solution
@@ -372,7 +420,7 @@ This avoids confusing implementers into thinking `critique` is mandatory in the 
 - `critique`: diagnose errors in a candidate answer
 - `route`: choose a branch or execution mode
 - `format`: convert answer to required schema/output style
-- `finalize`: emit the final output
+- `finalize`: emit the final output, usually as a deterministic sink/pass-through in V1
 
 ### 9.5 Route node semantics
 
@@ -463,6 +511,10 @@ class ProgramNode(BaseModel):
     name: str
     input_keys: list[str] = Field(default_factory=list)
     output_keys: list[str] = Field(default_factory=list)
+    execution_mode: Literal["llm_call", "pass_through", "decompose_macro"] = "llm_call"
+    expected_output_schema: dict[str, Any] = Field(default_factory=dict)
+    parser_id: str = "json"
+    fallback_parser_id: str = "regex_then_repair"
     prompt_modules: list[PromptModule] = Field(default_factory=list)
     route_spec: RouteSpec | None = None
     config: dict[str, Any] = Field(default_factory=dict)
@@ -488,12 +540,22 @@ For most node types, `output_keys` will contain exactly one state key.
 
 Examples:
 
-- `direct` -> `["final_answer"]`
+- `direct` -> `["candidate_answer"]`
 - `solve` -> `["candidate_answer"]`
 - `verify` -> `["verification_result"]`
 - `decompose` -> `["subquestions", "subquestion_answers", "decomposition_context"]`
+- `finalize` -> `["final_answer"]`
 
-Using `output_keys` avoids a schema mismatch for nodes that write multiple state fields.
+`execution_mode`, `expected_output_schema`, `parser_id`, and `fallback_parser_id` make the serialized IR self-sufficient enough for runtime execution and export.
+
+Recommended V1 defaults:
+
+- `direct`: `execution_mode="llm_call"`
+- `solve`: `execution_mode="llm_call"`
+- `verify`: `execution_mode="llm_call"`
+- `route`: `execution_mode="llm_call"`
+- `decompose`: `execution_mode="decompose_macro"`
+- `finalize`: `execution_mode="pass_through"` unless explicitly configured otherwise
 
 ### 10.2 Execution trace schema
 
@@ -537,7 +599,7 @@ Recommended artifact files:
 - `program.yaml`
 - `compile_trace.jsonl`
 - `metrics.json`
-- `report.md`
+- `summary.md`
 
 ---
 
@@ -571,13 +633,19 @@ The task analyzer should infer:
   "needs_decomposition": false,
   "input_heterogeneity": "medium",
   "candidate_routes": [
-    "direct_factoid",
-    "step_by_step_reasoning"
+    {
+      "label": "direct_factoid",
+      "description": "Use for direct factual or low-computation items."
+    },
+    {
+      "label": "step_by_step_reasoning",
+      "description": "Use for multi-step reasoning or arithmetic items."
+    }
   ],
   "initial_seed_templates": [
-    "direct",
+    "direct_finalize",
     "plan_solve_finalize",
-    "route_to_direct_or_reasoning"
+    "route_direct_or_solve_finalize"
   ]
 }
 ```
@@ -635,13 +703,13 @@ Representative examples:
 {examples_json}
 
 Available seed templates:
-- direct
+- direct_finalize
 - plan_solve_finalize
 - decompose_solve_finalize
 - solve_verify_finalize
-- route_direct_or_solve
+- route_direct_or_solve_finalize
 - plan_solve_verify_finalize
-- route_direct_or_plan_solve
+- route_direct_or_plan_solve_finalize
 
 Return JSON with these fields:
 - task_family
@@ -675,8 +743,8 @@ Recommended strict output schema:
     }
   ],
   "initial_seed_templates": [
-    "direct",
-    "route_direct_or_solve"
+    "direct_finalize",
+    "route_direct_or_solve_finalize"
   ],
   "analyzer_confidence": 0.73,
   "rationale": "Inputs mix direct and multi-step items."
@@ -729,13 +797,13 @@ Start from a small fixed seed library and let the search mutate from there.
 
 Implement these seeds:
 
-1. `direct -> finalize`
-2. `plan -> solve -> finalize`
-3. `decompose -> solve -> finalize`
-4. `solve -> verify -> finalize`
-5. `route -> direct|solve -> finalize`
-6. `plan -> solve -> verify -> finalize`
-7. `route -> direct|plan_solve -> finalize`
+1. `direct_finalize`: `direct -> finalize`
+2. `plan_solve_finalize`: `plan -> solve -> finalize`
+3. `decompose_solve_finalize`: `decompose -> solve -> finalize`
+4. `solve_verify_finalize`: `solve -> verify -> finalize`
+5. `route_direct_or_solve_finalize`: `route -> direct|solve -> finalize`
+6. `plan_solve_verify_finalize`: `plan -> solve -> verify -> finalize`
+7. `route_direct_or_plan_solve_finalize`: `route -> direct|plan_solve -> finalize`
 
 ### 13.3 Seed selection policy
 
@@ -773,7 +841,7 @@ Use these roles:
 ```python
 [
     PromptModule(role="instruction", text="Answer the question accurately."),
-    PromptModule(role="format", text="Return only the final answer."),
+    PromptModule(role="format", text="Return only the candidate answer."),
 ]
 ```
 
@@ -815,6 +883,7 @@ In V1:
 - create a fixed few-shot pool `E_fs` from a held-aside subset of the compile partition
 - never draw few-shot examples from screening, narrowing, confirmation, validation, or test shards
 - keep `E_fs` fixed for the entire compile run so comparisons remain reproducible
+- the compiler owns `E_fs` creation unless the caller explicitly supplies pre-partitioned datasets
 
 Recommended starting rule:
 
@@ -834,11 +903,28 @@ Execution steps:
 
 1. create initial execution state from input
 2. start at entry node
-3. render node prompt from state + modules
-4. call LLM
-5. parse output into structured state
-6. follow outgoing edge or selected route branch
-7. continue until finalize
+3. inspect the node's `execution_mode`
+4. if `execution_mode = "llm_call"`, render node prompt from state + modules, call the LLM, and parse the output into structured state
+5. if `execution_mode = "pass_through"`, apply a deterministic state transform with no model call
+6. if `execution_mode = "decompose_macro"`, run the bounded decompose subroutine and write its state outputs
+7. follow outgoing edge or selected route branch
+8. continue until finalize
+
+### 15.1.1 Direct and finalize state contract
+
+To keep `direct -> finalize` well-defined in V1:
+
+- `direct` should usually write `candidate_answer`
+- `solve` should usually write `candidate_answer`
+- `verify` should usually write `verification_result`
+- `finalize` should read from `candidate_answer`, `verification_result`, or another configured upstream key and write `final_answer`
+
+Recommended V1 default:
+
+- `finalize` is a deterministic sink/pass-through node with `execution_mode = "pass_through"`
+- `finalize` may optionally apply simple formatting or winner-selection rules, but should not call the LLM unless explicitly configured otherwise
+
+This keeps the runtime contract clean while preserving the seed library shape.
 
 ### 15.2 Execution state
 
@@ -987,7 +1073,7 @@ Where do route labels come from?
 
 Use **induced supervision**:
 
-1. run multiple branches on the same dev example
+1. run multiple branches on the same compile example from `E_search`
 2. observe which branch performs best
 3. assign that branch as the training label
 4. use these labels for classifier-route models or route evaluation
@@ -1020,9 +1106,10 @@ Search over:
 - route placement
 - route branches
 - node prompt modules
-- node ordering
 - verifier placement
 - format modules
+
+In V1, node ordering changes only implicitly through insertion, deletion, replacement, and route-splitting edits. There is no standalone reorder operator in the initial edit set.
 
 ### 17.2 Edit operators
 
@@ -1173,13 +1260,19 @@ Use three evaluation fidelities:
 
 1. **screening**
 2. **narrowing**
-3. **confirmation**
+3. **finalist validation (confirmation)**
+
+Canonical contract:
+
+- screening and narrowing run on shards sampled from `E_search`
+- confirmation runs on `E_val`
+- "confirmation" is not a separate data split; it is the finalist-validation pass on the held-out validation partition
 
 Suggested defaults:
 
 - screening: `8` examples
 - narrowing: `32` examples
-- confirmation: full dev set or `64` to `128` examples
+- confirmation: full validation set `E_val` or `64` to `128` examples
 
 ### 18.5 Beam settings
 
@@ -1222,20 +1315,21 @@ After screening:
 ### 18.8 Pseudocode
 
 ```python
-def compile_task(task_spec, compile_examples, validation_examples, budget):
-    analysis = analyze_task(task_spec, compile_examples[:5])
+def compile_task(task_spec, E_search, E_val, budget):
+    analysis = analyze_task(task_spec, E_search[:5])
     baseline = instantiate_direct_baseline(task_spec)
     beam = instantiate_seed_programs(
         analysis,
         include_direct_baseline=True,
     )
-    seed_scores = quick_score_and_prune(beam, compile_examples[:8], budget)
+    seed_scores = quick_score_and_prune(beam, E_search[:8], budget)
 
     if analyzer_failed(seed_scores, baseline, reseed_margin=RESEED_MARGIN):
         beam = instantiate_full_seed_library(task_spec)
-        seed_scores = quick_score_and_prune(beam, compile_examples[:8], budget)
+        seed_scores = quick_score_and_prune(beam, E_search[:8], budget)
 
     archive = list(seed_scores)
+    confirmed_archive = []
     beam = select_diverse_beam(seed_scores, min_families=MIN_STRUCTURAL_FAMILIES)
     for round_idx in range(MAX_ROUNDS):
         proposals = []
@@ -1247,15 +1341,23 @@ def compile_task(task_spec, compile_examples, validation_examples, budget):
                     proposals.append(candidate)
 
         proposals = dedupe(proposals)
-        scored = evaluate_multi_fidelity(proposals, compile_examples, budget)
+        scored = evaluate_multi_fidelity(proposals, E_search, budget)
         beam = select_diverse_beam(scored, min_families=MIN_STRUCTURAL_FAMILIES)
         archive.extend(scored)
 
-        if early_stop(beam, archive, budget):
+        confirmed_archive = maybe_confirm_incumbent(
+            beam=beam,
+            E_val=E_val,
+            budget=budget,
+            confirmed_archive=confirmed_archive,
+        )
+
+        if early_stop(beam, confirmed_archive, budget):
             break
 
-    finalists = confirm_top_candidates(beam, validation_examples, budget)
-    return choose_smallest_effective(finalists)
+    finalists = confirm_top_candidates(beam, E_val, budget)
+    confirmed_candidates = dedupe_by_fingerprint(finalists + confirmed_archive)
+    return choose_smallest_effective(confirmed_candidates)
 ```
 
 `early_stop` should be implemented deterministically.
@@ -1274,7 +1376,8 @@ Recommended V1 defaults:
 
 Important rule on budget exhaustion:
 
-- if budget is exhausted mid-round, discard unconfirmed partial candidates from that round and return the **best confirmed program** already stored in the archive
+- if budget is exhausted mid-round, discard unconfirmed partial candidates from that round and return the **best confirmed program** already stored in `confirmed_archive`
+- if `confirmed_archive` is still empty, spend from the reserved confirmation budget to confirm the top surviving beam candidate before returning
 - do not return the current beam if its members have not cleared confirmation
 
 This makes termination reproducible and prevents accidental selection of half-evaluated candidates.
@@ -1296,6 +1399,20 @@ If confirmation budget is insufficient to evaluate all `confirm_top_k` candidate
 
 This keeps final selection tied to confirmed validation results rather than search-time estimates.
 
+Important:
+
+- `confirm_top_candidates` does **not** replace `confirmed_archive`
+- the final selector must see the union of newly confirmed finalists and earlier confirmed incumbents
+- dedupe that union by topology fingerprint or program id before calling `choose_smallest_effective`
+
+`maybe_confirm_incumbent` is a smaller helper used during search.
+
+Recommended V1 rule:
+
+- after each round, if the current beam leader beats the best confirmed score by at least `early_stop_min_improvement` and there is confirmation budget remaining, confirm the top `1` incumbent on `E_val`
+- append that result to `confirmed_archive`
+- skip interim confirmation if the remaining confirmation budget would be threatened
+
 ---
 
 ## 19. Evaluation Strategy During Compile
@@ -1311,6 +1428,8 @@ For every candidate:
 1. evaluate on a tiny shard
 2. estimate score + variance
 3. allocate more examples only if promising
+
+The shard size is constrained by the remaining LLM-call budget, not just by the nominal example count. If a program is deep or triggers repair/decompose subcalls, the scheduler should stop early once the shard reaches the budget cap for that phase.
 
 ### 19.3 Confidence-aware candidate promotion
 
@@ -1359,7 +1478,7 @@ Reasonable starting values:
 
 These will need tuning.
 
-Calibrate `epsilon` to observed score variance on the dev slice. Do not set one global `epsilon` value for every benchmark.
+Calibrate `epsilon` to observed score variance on `E_val`. Do not set one global `epsilon` value for every benchmark.
 
 ### 20.3 Why the two-stage selector matters
 
@@ -1475,7 +1594,7 @@ For every evaluated candidate, store:
 - node type counts
 - route count
 - prompt module tags
-- dev metric
+- validation metric
 - token cost
 - latency
 - parse failure rate
@@ -1600,9 +1719,9 @@ This is enough to prove that structure discovery matters across task types.
 
 For each benchmark:
 
-- compile on a dev slice
-- choose final program on validation
-- test once on held-out set
+- search on `E_search`
+- choose the final program on `E_val`
+- test once on `E_test`
 
 Never search on the test set.
 
@@ -1667,6 +1786,12 @@ This is a starting ledger, not a law. But every run should log:
 - remaining reserve after each search round
 
 If the search scheduler reallocates budget dynamically, that reallocation must be persisted in the run artifacts.
+
+Important:
+
+- these ledger values are measured in **LLM invocations**, not candidate counts
+- `screening_examples`, `narrowing_examples`, and `confirmation_examples` are maximum example counts per candidate stage, not guaranteed counts
+- the scheduler must convert phase budgets into per-candidate evaluation caps using the actual invocation cost of each program
 
 Confirmation should consume from `confirmation_budget_calls` first. The emergency reserve exists for unexpected failures, re-seeding, or parser-repair spikes, not as the default source of finalist confirmation budget.
 
@@ -1780,11 +1905,11 @@ For every compile run, log:
 - winning topology family
 - runner-up topology family
 - benchmark/task category
-- whether the winning topology is stable across reruns or resampled dev slices
+- whether the winning topology is stable across reruns or resampled compile slices
 
 Operationalize stability as:
 
-- the same topology family wins on at least `2` of `3` resampled dev splits of equal size, or
+- the same topology family wins on at least `2` of `3` resampled compile splits of equal size, or
 - topology-family entropy across those `3` runs stays below a configured threshold such as `0.9`
 
 Pick one of these as the primary reported criterion and keep the other as a robustness check.
@@ -1818,7 +1943,7 @@ This validates the compiler thesis.
 
 ### 27.5 Mixture-shift experiment
 
-Create mixed dev/test pools where question types vary.
+Create mixed compile/test pools where question types vary.
 
 Measure whether routed programs remain stable under changed mixtures.
 
@@ -1992,7 +2117,7 @@ Build:
 
 - description length computation
 - effective-set selector
-- report generator
+- summary generator
 
 Exit criteria:
 
@@ -2072,6 +2197,7 @@ model:
   max_output_tokens: 800
 
 compile:
+  budget_unit: llm_invocation
   total_budget_calls: 500
   analyzer_budget_calls: 20
   seed_budget_calls: 60
@@ -2366,11 +2492,11 @@ Mitigation:
 - route confidence logging
 - oracle-route comparison
 
-### 38.6 Overfitting to dev set
+### 38.6 Overfitting to search or validation partitions
 
 Problem:
 
-- topology search exploits quirks of the compile set
+- topology search exploits quirks of `E_search` or `E_val`
 
 Mitigation:
 
@@ -2432,7 +2558,7 @@ If you need the smallest version worth implementing first, build exactly this:
 ### Inputs
 
 - task description
-- 32 dev examples
+- 32 compile examples
 - one black-box model
 
 ### Allowed node types
@@ -2442,6 +2568,8 @@ If you need the smallest version worth implementing first, build exactly this:
 - `verify`
 - `route`
 - `finalize`
+
+In the MVP, formatting should be handled through prompt modules plus `finalize`; do not introduce standalone `format` nodes yet.
 
 ### Allowed seeds
 
