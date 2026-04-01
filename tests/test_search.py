@@ -31,6 +31,21 @@ def test_compile_task_runs_end_to_end(fake_backend, small_config, gsm8k_examples
     assert artifact.candidate_archive
 
 
+def test_compile_budget_override_rebalances_phase_budgets(fake_backend, gsm8k_examples, tmp_path):
+    artifact = compile_task(
+        task_description="Answer simple arithmetic questions accurately.",
+        examples=gsm8k_examples,
+        metric="gsm8k",
+        backend=fake_backend,
+        compile_budget=48,
+        output_dir=tmp_path / "budget_run",
+        task_id="gsm8k_budget_override",
+    )
+
+    assert artifact.metrics.planned_budget_calls == 48
+    assert sum(phase.planned_calls for phase in artifact.metrics.planned_budget_by_phase) == 48
+
+
 def test_evaluate_program_runs_full_dataset_without_compile_budget_cap(fake_backend, small_config, simple_task_spec):
     analysis = TaskAnalysis(needs_reasoning=False, initial_seed_templates=["direct_finalize"])
     program = instantiate_seed_program(task_spec=simple_task_spec, analysis=analysis, template_name="direct_finalize")

@@ -70,7 +70,9 @@ def compile_task(
         if model is not None:
             config.model.name = model
         if compile_budget is not None:
-            config.compile.total_budget_calls = compile_budget
+            config.compile.rebalance_phase_budgets(compile_budget)
+    if compile_budget is not None and config.compile.phase_budget_total() != compile_budget:
+        config.compile.rebalance_phase_budgets(compile_budget)
 
     backend = backend or OpenAIBackend()
     reporter = progress_reporter or CompileProgressReporter(enabled=show_progress, verbosity=progress_verbosity)

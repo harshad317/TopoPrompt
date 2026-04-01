@@ -7,6 +7,16 @@ import yaml
 from pydantic import BaseModel, Field
 
 
+COMPILE_BUDGET_PHASE_FIELDS = (
+    "analyzer_budget_calls",
+    "seed_budget_calls",
+    "screening_budget_calls",
+    "narrowing_budget_calls",
+    "confirmation_budget_calls",
+    "reserve_budget_calls",
+)
+
+
 class ModelConfig(BaseModel):
     name: str = "gpt-4.1-mini"
     repair_model: str | None = None
@@ -39,6 +49,35 @@ class CompileConfig(BaseModel):
     reseed_margin: float = 0.04
     llm_edit_proposals_per_parent: int = 2
     llm_edit_proposals_enabled: bool = True
+
+    def phase_budget_total(self) -> int:
+        return sum(getattr(self, field_name) for field_name in COMPILE_BUDGET_PHASE_FIELDS)
+
+    def rebalance_phase_budgets(self, total_budget_calls: int | None = None) -> None:
+        target_total = self.total_budget_calls if total_budget_calls is None else total_budget_calls
+        current_values = [getattr(self, field_name) for field_name in COMPILE_BUDGET_PHASE_FIELDS]
+        current_total = sum(current_values)
+        self.total_budget_calls = target_total
+        if current_total <= 0:
+            even_split = [0 for _ in COMPILE_BUDGET_PHASE_FIELDS]
+            if COMPILE_BUDGET_PHASE_FIELDS:
+                even_split[0] = target_total
+            for field_name, value in zip(COMPILE_BUDGET_PHASE_FIELDS, even_split, strict=False):
+                setattr(self, field_name, value)
+            return
+
+        scaled = [value * target_total / current_total for value in current_values]
+        rebalanced = [int(value) for value in scaled]
+        remaining = target_total - sum(rebalanced)
+        fractional_order = sorted(
+            range(len(COMPILE_BUDGET_PHASE_FIELDS)),
+            key=lambda index: (scaled[index] - rebalanced[index], -index),
+            reverse=True,
+        )
+        for index in fractional_order[:remaining]:
+            rebalanced[index] += 1
+        for field_name, value in zip(COMPILE_BUDGET_PHASE_FIELDS, rebalanced, strict=False):
+            setattr(self, field_name, value)
 
 
 class ProgramConfig(BaseModel):
@@ -110,4 +149,3 @@ def _deep_merge_dicts(base: dict[str, Any], updates: dict[str, Any]) -> dict[str
         else:
             merged[key] = value
     return merged
-
