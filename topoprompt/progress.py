@@ -19,7 +19,7 @@ class CompileProgressReporter:
     ) -> None:
         self.enabled = enabled
         self.verbosity = verbosity
-        self.console = console or Console(stderr=True, soft_wrap=True)
+        self.console = console or Console(stderr=True, soft_wrap=True, log_path=False, log_time=False)
 
     def rule(self, title: str, *, level: int = 1, style: str = "bold cyan") -> None:
         if self.enabled and self.verbosity >= level:
@@ -27,10 +27,7 @@ class CompileProgressReporter:
 
     def log(self, message: str, *, level: int = 1, style: str | None = None) -> None:
         if self.enabled and self.verbosity >= level:
-            if style:
-                self.console.log(f"[{style}]{message}[/{style}]")
-            else:
-                self.console.log(message)
+            tqdm.write(message, file=self.console.file)
 
     def track(
         self,
@@ -76,7 +73,7 @@ class CompileProgressReporter:
         table.add_row("rationale", getattr(analysis, "rationale", ""))
         self.console.print(table)
 
-    def log_candidate(self, candidate: Any, *, prefix: str = "", level: int = 1) -> None:
+    def log_candidate(self, candidate: Any, *, prefix: str = "", level: int = 2) -> None:
         if not self.enabled or self.verbosity < level:
             return
         self.log(
@@ -100,8 +97,7 @@ class CompileProgressReporter:
                 f"example {example_id} via {program_id}: "
                 f"score={score:.2f} calls={invocations} parse_failures={parse_failures}"
             ),
-            level=2,
-            style="blue",
+            level=3,
         )
 
     def log_node_event(
@@ -119,9 +115,8 @@ class CompileProgressReporter:
             detail += f" branch={route_choice}"
         if parse_error:
             detail += f" parse_error={parse_error}"
-        self.log(detail, level=3, style="yellow")
+        self.log(detail, level=4)
 
     def log_budget(self, *, spent: int, planned: int, phase: str | None = None, level: int = 1) -> None:
         label = f"{phase}: " if phase else ""
-        self.log(f"{label}budget {spent}/{planned} calls spent", level=level, style="cyan")
-
+        self.log(f"{label}budget {spent}/{planned} calls spent", level=level)
