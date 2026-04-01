@@ -1,0 +1,14 @@
+.pytest_cache/
+__pycache__/
+.DS_Store
+.venv/
+.deepeval/
+.topoprompt_cache/
+*.pyc
+*.pyo
+*.sqlite
+*.db
+*.log
+runs/
+dist/
+build/

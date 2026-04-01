@@ -1,0 +1,7 @@
+{"example_id":"mmlu_1","question":"Which city is the capital of France?","choices":[{"label":"A","text":"Paris"},{"label":"B","text":"Berlin"},{"label":"C","text":"Rome"},{"label":"D","text":"Madrid"}],"target":"A"}
+{"example_id":"mmlu_2","question":"Which city is the capital of Japan?","choices":[{"label":"A","text":"Tokyo"},{"label":"B","text":"Seoul"},{"label":"C","text":"Beijing"},{"label":"D","text":"Bangkok"}],"target":"A"}
+{"example_id":"mmlu_3","question":"Which city is the capital of France?","choices":[{"label":"A","text":"Paris"},{"label":"B","text":"Lisbon"},{"label":"C","text":"Vienna"},{"label":"D","text":"Prague"}],"target":"A"}
+{"example_id":"mmlu_4","question":"Which city is the capital of Japan?","choices":[{"label":"A","text":"Tokyo"},{"label":"B","text":"Osaka"},{"label":"C","text":"Kyoto"},{"label":"D","text":"Nagoya"}],"target":"A"}
+{"example_id":"mmlu_5","question":"Which city is the capital of France?","choices":[{"label":"A","text":"Paris"},{"label":"B","text":"Athens"},{"label":"C","text":"Warsaw"},{"label":"D","text":"Bern"}],"target":"A"}
+{"example_id":"mmlu_6","question":"Which city is the capital of Japan?","choices":[{"label":"A","text":"Tokyo"},{"label":"B","text":"Delhi"},{"label":"C","text":"Manila"},{"label":"D","text":"Hanoi"}],"target":"A"}
+

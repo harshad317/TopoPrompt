@@ -1,0 +1,7 @@
+{"example_id":"gsm8k_1","question":"What is 2 + 2?","target":"4"}
+{"example_id":"gsm8k_2","question":"What is 5 + 3?","target":"8"}
+{"example_id":"gsm8k_3","question":"What is 9 - 4?","target":"5"}
+{"example_id":"gsm8k_4","question":"What is 6 + 7?","target":"13"}
+{"example_id":"gsm8k_5","question":"What is 3 * 3?","target":"9"}
+{"example_id":"gsm8k_6","question":"What is 8 + 1?","target":"9"}
+

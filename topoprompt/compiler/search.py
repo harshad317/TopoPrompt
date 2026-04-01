@@ -1,0 +1,773 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from statistics import mean
+from typing import Any, Callable
+
+from topoprompt.artifacts import write_compile_artifact
+from topoprompt.backends.dspy_backend import compile_to_dspy
+from topoprompt.backends.llm_client import FakeBackend, LLMBackend
+from topoprompt.backends.openai_backend import OpenAIBackend
+from topoprompt.compiler.analyzer import analyze_task
+from topoprompt.compiler.edits import apply_edit, generate_heuristic_edits
+from topoprompt.compiler.objective import description_length, search_score
+from topoprompt.compiler.seeds import SEED_LIBRARY, instantiate_seed_programs
+from topoprompt.compiler.selector import choose_smallest_effective
+from topoprompt.compiler.validator import ProgramValidationError, validate_program
+from topoprompt.config import TopoPromptConfig, load_config
+from topoprompt.eval.budget import BudgetLedger
+from topoprompt.eval.datasets import DatasetPartitions, partition_examples
+from topoprompt.eval.metrics import MetricFn, metric_for_name
+from topoprompt.ir import family_signature, topology_fingerprint
+from topoprompt.runtime.executor import BudgetExhausted, ProgramExecutor
+from topoprompt.runtime.trace import aggregate_route_metrics
+from topoprompt.schemas import (
+    CandidateArchiveRecord,
+    CandidateEdit,
+    CandidateEvaluation,
+    CompileArtifact,
+    CompileMetrics,
+    Example,
+    PromptProgram,
+    RouteDiagnostic,
+    TaskAnalysis,
+    TaskSpec,
+)
+from topoprompt.transfer.features import extract_transfer_features
+from topoprompt.transfer.store import TraceStore
+
+
+def compile_task(
+    *,
+    task_description: str,
+    examples: list[Example],
+    model: str | None = None,
+    compile_budget: int | None = None,
+    metric: str | MetricFn | None = None,
+    config: TopoPromptConfig | None = None,
+    config_path: str | Path | None = None,
+    backend: LLMBackend | None = None,
+    output_dir: str | Path | None = None,
+    task_id: str | None = None,
+    search_examples: list[Example] | None = None,
+    validation_examples: list[Example] | None = None,
+    fewshot_examples: list[Example] | None = None,
+) -> CompileArtifact:
+    if config is None:
+        overrides: dict[str, Any] = {}
+        if model is not None:
+            overrides.setdefault("model", {})["name"] = model
+        if compile_budget is not None:
+            overrides.setdefault("compile", {})["total_budget_calls"] = compile_budget
+        config = load_config(config_path, overrides=overrides)
+    else:
+        config = TopoPromptConfig.model_validate(config.model_dump())
+        if model is not None:
+            config.model.name = model
+        if compile_budget is not None:
+            config.compile.total_budget_calls = compile_budget
+
+    backend = backend or OpenAIBackend()
+    metric_name, metric_fn = _resolve_metric(metric)
+    partitions = _resolve_partitions(
+        examples=examples,
+        config=config,
+        search_examples=search_examples,
+        validation_examples=validation_examples,
+        fewshot_examples=fewshot_examples,
+    )
+    task_spec = _infer_task_spec(task_description=task_description, examples=examples, task_id=task_id)
+    budget = BudgetLedger.from_compile_config(config.compile)
+    trace_store = TraceStore(Path(output_dir) / "transfer_trace_store.jsonl" if output_dir else None)
+
+    analysis = _run_analysis(task_spec=task_spec, examples=partitions.search_examples, metric_name=metric_name, backend=backend, config=config, budget=budget)
+    seed_names = (analysis.initial_seed_templates or SEED_LIBRARY)[:5]
+    seed_programs = instantiate_seed_programs(
+        task_spec=task_spec,
+        analysis=analysis,
+        include_direct_baseline=config.compile.always_include_direct_seed,
+        seed_names=seed_names,
+    )
+    seed_programs = [program for program in seed_programs if _validate_candidate(program, config)]
+
+    seed_evals = [
+        _evaluate_candidate(
+            program=program,
+            task_spec=task_spec,
+            examples=partitions.search_examples,
+            metric_fn=metric_fn,
+            backend=backend,
+            config=config,
+            budget=budget,
+            phase="seed",
+            stage="screening",
+            max_examples=config.compile.screening_examples,
+            fewshot_examples=partitions.fewshot_examples,
+        )
+        for program in seed_programs
+    ]
+    seed_evals = [evaluation for evaluation in seed_evals if evaluation is not None]
+
+    direct_baseline = next((evaluation for evaluation in seed_evals if evaluation.program.program_id == "direct_finalize"), None)
+    best_non_direct = max((evaluation.score for evaluation in seed_evals if evaluation.program.program_id != "direct_finalize"), default=0.0)
+    if direct_baseline is not None and best_non_direct < direct_baseline.score - config.compile.reseed_margin:
+        seed_programs = instantiate_seed_programs(
+            task_spec=task_spec,
+            analysis=analysis,
+            include_direct_baseline=config.compile.always_include_direct_seed,
+            seed_names=SEED_LIBRARY,
+        )
+        seed_programs = [program for program in seed_programs if _validate_candidate(program, config)]
+        seed_evals = [
+            _evaluate_candidate(
+                program=program,
+                task_spec=task_spec,
+                examples=partitions.search_examples,
+                metric_fn=metric_fn,
+                backend=backend,
+                config=config,
+                budget=budget,
+                phase="seed",
+                stage="screening",
+                max_examples=config.compile.screening_examples,
+                fewshot_examples=partitions.fewshot_examples,
+            )
+            for program in seed_programs
+        ]
+        seed_evals = [evaluation for evaluation in seed_evals if evaluation is not None]
+
+    archive_records = [_archive_record(candidate, round_index=0) for candidate in seed_evals]
+    compile_traces = [trace for candidate in seed_evals for trace in candidate.traces]
+    beam = _select_diverse_beam(seed_evals, width=config.compile.beam_width, min_families=config.compile.min_structural_families)
+    confirmed_archive: list[CandidateEvaluation] = []
+    beam_family_count_by_round = [len({candidate.family_signature for candidate in beam})] if beam else [0]
+    best_beam_score = max((candidate.search_score for candidate in beam), default=0.0)
+    stale_rounds = 0
+
+    for round_index in range(1, config.compile.max_rounds + 1):
+        proposals: list[tuple[PromptProgram, str, str]] = []
+        for parent in beam:
+            edits = generate_heuristic_edits(program=parent.program, analysis=analysis, config=config)
+            if config.compile.llm_edit_proposals_enabled:
+                edits.extend(
+                    _llm_guided_edit_proposals(
+                        parent=parent,
+                        analysis=analysis,
+                        backend=backend,
+                        config=config,
+                        budget=budget,
+                    )
+                )
+            for edit in _dedupe_edits(edits):
+                try:
+                    candidate = apply_edit(
+                        program=parent.program,
+                        edit=edit,
+                        analysis=analysis,
+                        fewshot_pool=partitions.fewshot_examples,
+                    )
+                    validate_program(candidate, config.program)
+                    proposals.append((candidate, parent.program.program_id, edit.model_dump_json()))
+                except (ProgramValidationError, ValueError, KeyError):
+                    continue
+
+        proposals = _dedupe_proposals(proposals)
+        if not proposals:
+            break
+
+        scored = _evaluate_candidates_multi_fidelity(
+            proposals=proposals,
+            task_spec=task_spec,
+            examples=partitions.search_examples,
+            metric_fn=metric_fn,
+            backend=backend,
+            config=config,
+            budget=budget,
+            fewshot_examples=partitions.fewshot_examples,
+        )
+        if not scored:
+            break
+
+        for candidate in scored:
+            compile_traces.extend(candidate.traces)
+            trace_store.append(extract_transfer_features(task_spec=task_spec, program=candidate.program, candidate=candidate))
+            archive_records.append(_archive_record(candidate, round_index=round_index))
+
+        beam = _select_diverse_beam(scored, width=config.compile.beam_width, min_families=config.compile.min_structural_families)
+        beam_family_count_by_round.append(len({candidate.family_signature for candidate in beam}))
+        if not beam:
+            break
+
+        leader = beam[0]
+        best_confirmed = max((candidate.score for candidate in confirmed_archive), default=-1.0)
+        if leader.score >= best_confirmed + config.compile.early_stop_min_improvement and budget.remaining("confirmation") > 0:
+            confirmed = _confirm_candidates(
+                candidates=[leader],
+                task_spec=task_spec,
+                validation_examples=partitions.validation_examples,
+                metric_fn=metric_fn,
+                backend=backend,
+                config=config,
+                budget=budget,
+            )
+            confirmed_archive.extend(confirmed)
+            compile_traces.extend(trace for candidate in confirmed for trace in candidate.traces)
+
+        current_best = max(candidate.search_score for candidate in beam)
+        if current_best < best_beam_score + config.compile.early_stop_min_improvement:
+            stale_rounds += 1
+        else:
+            best_beam_score = current_best
+            stale_rounds = 0
+        if stale_rounds >= config.compile.early_stop_patience_rounds:
+            break
+        if budget.remaining("confirmation") <= 0 and budget.remaining("screening") <= 0 and budget.remaining("narrowing") <= 0:
+            break
+
+    finalists = _confirm_candidates(
+        candidates=beam[: config.compile.confirm_top_k],
+        task_spec=task_spec,
+        validation_examples=partitions.validation_examples,
+        metric_fn=metric_fn,
+        backend=backend,
+        config=config,
+        budget=budget,
+    )
+    compile_traces.extend(trace for candidate in finalists for trace in candidate.traces)
+    confirmed_candidates = _dedupe_confirmed(finalists + confirmed_archive + seed_evals[:1])
+    if not confirmed_candidates:
+        confirmed_candidates = seed_evals
+    best_candidate, smallest_effective, epsilon, _effective = choose_smallest_effective(
+        confirmed_candidates,
+        objective_config=config.objective,
+    )
+    route_accuracy, route_regret = aggregate_route_metrics(smallest_effective.traces)
+
+    metrics = CompileMetrics(
+        best_program_id=best_candidate.program.program_id,
+        best_validation_score=best_candidate.score,
+        smallest_effective_program_id=smallest_effective.program.program_id,
+        smallest_effective_score=smallest_effective.score,
+        epsilon=epsilon,
+        planned_budget_calls=budget.planned_total(),
+        spent_budget_calls=budget.spent_total(),
+        planned_budget_by_phase=[
+            phase.model_copy(update={"spent_calls": 0})
+            for phase in budget.snapshot()
+        ],
+        spent_budget_by_phase=budget.snapshot(),
+        winning_topology_family=smallest_effective.family_signature,
+        beam_family_count_by_round=beam_family_count_by_round,
+        parser_failure_rate=smallest_effective.parse_failure_rate,
+        route_accuracy=route_accuracy,
+        route_regret=route_regret,
+    )
+    dspy_program = compile_to_dspy(program=smallest_effective.program, task_spec=task_spec, config=config, backend=backend)
+    artifact = CompileArtifact(
+        task_spec=task_spec,
+        program_ir=smallest_effective.program,
+        python_program=smallest_effective.program,
+        dspy_program=dspy_program,
+        seed_programs=seed_programs,
+        candidate_archive=archive_records,
+        compile_trace=compile_traces,
+        metrics=metrics,
+        config=config.model_dump(mode="json"),
+        output_dir=str(output_dir) if output_dir else None,
+    )
+    if output_dir is not None:
+        write_compile_artifact(artifact, output_dir)
+        trace_store.flush()
+    return artifact
+
+
+def evaluate_program_on_examples(
+    *,
+    program: PromptProgram,
+    task_spec: TaskSpec,
+    examples: list[Example],
+    metric_fn: MetricFn,
+    backend: LLMBackend,
+    config: TopoPromptConfig,
+    phase: str,
+) -> dict[str, Any]:
+    budget = BudgetLedger.from_compile_config(config.compile)
+    evaluation = _evaluate_candidate(
+        program=program,
+        task_spec=task_spec,
+        examples=examples,
+        metric_fn=metric_fn,
+        backend=backend,
+        config=config,
+        budget=budget,
+        phase=phase,
+        stage=phase,
+        max_examples=len(examples),
+        fewshot_examples=[],
+    )
+    assert evaluation is not None
+    return {
+        "score": evaluation.score,
+        "mean_invocations": evaluation.mean_invocations,
+        "mean_tokens": evaluation.mean_tokens,
+        "parse_failure_rate": evaluation.parse_failure_rate,
+        "traces": [trace.model_dump(mode="json") for trace in evaluation.traces],
+    }
+
+
+def _resolve_metric(metric: str | MetricFn | None) -> tuple[str, MetricFn]:
+    if callable(metric):
+        return getattr(metric, "__name__", "custom_metric"), metric
+    metric_name = metric or "exact_match"
+    return metric_name, metric_for_name(metric_name)
+
+
+def _resolve_partitions(
+    *,
+    examples: list[Example],
+    config: TopoPromptConfig,
+    search_examples: list[Example] | None,
+    validation_examples: list[Example] | None,
+    fewshot_examples: list[Example] | None,
+) -> DatasetPartitions:
+    if search_examples is not None and validation_examples is not None:
+        fs = fewshot_examples or search_examples[: min(len(search_examples), config.data.fewshot_pool_max_examples)]
+        return DatasetPartitions(
+            compile_examples=(fewshot_examples or []) + search_examples,
+            fewshot_examples=fs,
+            search_examples=search_examples,
+            validation_examples=validation_examples,
+            test_examples=[],
+        )
+    return partition_examples(examples, data_config=config.data, create_test_split=False)
+
+
+def _infer_task_spec(*, task_description: str, examples: list[Example], task_id: str | None) -> TaskSpec:
+    input_schema = {key: type(value).__name__ for key, value in (examples[0].input.items() if examples else [])}
+    output_schema = {"type": type(examples[0].target).__name__} if examples and examples[0].target is not None else {"type": "string"}
+    return TaskSpec(
+        task_id=task_id or "compiled_task",
+        description=task_description,
+        input_schema=input_schema,
+        output_schema=output_schema,
+        task_family=None,
+        metadata={},
+    )
+
+
+def _run_analysis(
+    *,
+    task_spec: TaskSpec,
+    examples: list[Example],
+    metric_name: str,
+    backend: LLMBackend,
+    config: TopoPromptConfig,
+    budget: BudgetLedger,
+) -> TaskAnalysis:
+    if not budget.spend("analyzer", 1, allow_reserve=True):
+        return TaskAnalysis(initial_seed_templates=["direct_finalize"])
+    analysis = analyze_task(task_spec=task_spec, examples=examples, metric_name=metric_name, backend=backend, config=config)
+    task_spec.task_family = analysis.task_family
+    return analysis
+
+
+def _evaluate_candidate(
+    *,
+    program: PromptProgram,
+    task_spec: TaskSpec,
+    examples: list[Example],
+    metric_fn: MetricFn,
+    backend: LLMBackend,
+    config: TopoPromptConfig,
+    budget: BudgetLedger,
+    phase: str,
+    stage: str,
+    max_examples: int,
+    fewshot_examples: list[Example],
+    parent_id: str | None = None,
+    edit_applied: str | None = None,
+) -> CandidateEvaluation | None:
+    executor = ProgramExecutor(backend=backend, config=config, budget_ledger=budget)
+    traces = []
+    scores = []
+    for example in examples[:max_examples]:
+        try:
+            result = executor.run_program(
+                program=program,
+                task_spec=task_spec,
+                example_id=example.example_id,
+                task_input=example.input,
+                phase=phase,
+            )
+        except BudgetExhausted:
+            break
+        trace = result.trace
+        trace.correctness = metric_fn(trace.final_output, example)
+        traces.append(trace)
+        scores.append(trace.correctness)
+    if not traces:
+        return None
+
+    route_diagnostics = _induce_route_diagnostics(
+        program=program,
+        task_spec=task_spec,
+        examples=examples[: min(3, len(traces))],
+        base_traces=traces,
+        metric_fn=metric_fn,
+        backend=backend,
+        config=config,
+        budget=budget,
+    )
+    for diagnostic in route_diagnostics:
+        for trace in traces:
+            if trace.example_id == diagnostic.example_id:
+                trace.route_diagnostics.append(diagnostic)
+
+    complexity = description_length(program, config.program)
+    mean_invocations = mean(trace.total_invocations for trace in traces)
+    mean_tokens = mean(trace.total_tokens for trace in traces)
+    parse_failure_rate = sum(trace.parse_failures for trace in traces) / max(
+        1, sum(len(trace.node_traces) for trace in traces)
+    )
+    perf = mean(scores)
+    candidate = CandidateEvaluation(
+        program=program,
+        topology_fingerprint=topology_fingerprint(program),
+        family_signature=family_signature(program),
+        stage=stage,
+        parent_id=parent_id,
+        edit_applied=edit_applied,
+        example_scores=scores,
+        score=perf,
+        search_score=search_score(
+            perf=perf,
+            mean_invocations=mean_invocations,
+            complexity=complexity,
+            parse_failure_rate=parse_failure_rate,
+            objective_config=config.objective,
+            program_config=config.program,
+        ),
+        mean_invocations=mean_invocations,
+        mean_tokens=mean_tokens,
+        complexity=complexity,
+        parse_failure_rate=parse_failure_rate,
+        traces=traces,
+        route_diagnostics=route_diagnostics,
+        metadata={"fewshot_pool_size": len(fewshot_examples)},
+    )
+    return candidate
+
+
+def _evaluate_candidates_multi_fidelity(
+    *,
+    proposals: list[tuple[PromptProgram, str, str]],
+    task_spec: TaskSpec,
+    examples: list[Example],
+    metric_fn: MetricFn,
+    backend: LLMBackend,
+    config: TopoPromptConfig,
+    budget: BudgetLedger,
+    fewshot_examples: list[Example],
+) -> list[CandidateEvaluation]:
+    screened: list[CandidateEvaluation] = []
+    for program, parent_id, edit_applied in proposals:
+        evaluation = _evaluate_candidate(
+            program=program,
+            task_spec=task_spec,
+            examples=examples,
+            metric_fn=metric_fn,
+            backend=backend,
+            config=config,
+            budget=budget,
+            phase="screening",
+            stage="screening",
+            max_examples=config.compile.screening_examples,
+            fewshot_examples=fewshot_examples,
+            parent_id=parent_id,
+            edit_applied=edit_applied,
+        )
+        if evaluation is not None:
+            screened.append(evaluation)
+    if not screened:
+        return []
+    best_screen = max(candidate.search_score for candidate in screened)
+    promising = [
+        candidate
+        for candidate in screened
+        if candidate.search_score >= best_screen - 0.15 and candidate.parse_failure_rate <= 0.5
+    ]
+    promising = sorted(promising, key=lambda item: item.search_score, reverse=True)
+    narrowed: list[CandidateEvaluation] = []
+    limit = max(config.compile.beam_width * 2, config.compile.min_structural_families)
+    for candidate in promising[:limit]:
+        narrowed_eval = _evaluate_candidate(
+            program=candidate.program,
+            task_spec=task_spec,
+            examples=examples,
+            metric_fn=metric_fn,
+            backend=backend,
+            config=config,
+            budget=budget,
+            phase="narrowing",
+            stage="narrowing",
+            max_examples=config.compile.narrowing_examples,
+            fewshot_examples=fewshot_examples,
+            parent_id=candidate.parent_id,
+            edit_applied=candidate.edit_applied,
+        )
+        if narrowed_eval is not None:
+            narrowed.append(narrowed_eval)
+    return narrowed or screened
+
+
+def _confirm_candidates(
+    *,
+    candidates: list[CandidateEvaluation],
+    task_spec: TaskSpec,
+    validation_examples: list[Example],
+    metric_fn: MetricFn,
+    backend: LLMBackend,
+    config: TopoPromptConfig,
+    budget: BudgetLedger,
+) -> list[CandidateEvaluation]:
+    confirmed: list[CandidateEvaluation] = []
+    for candidate in sorted(candidates, key=lambda item: item.search_score, reverse=True):
+        evaluation = _evaluate_candidate(
+            program=candidate.program,
+            task_spec=task_spec,
+            examples=validation_examples,
+            metric_fn=metric_fn,
+            backend=backend,
+            config=config,
+            budget=budget,
+            phase="confirmation",
+            stage="confirmation",
+            max_examples=min(len(validation_examples), config.compile.confirmation_examples),
+            fewshot_examples=[],
+            parent_id=candidate.parent_id,
+            edit_applied=candidate.edit_applied,
+        )
+        if evaluation is not None:
+            confirmed.append(evaluation)
+    return confirmed
+
+
+def _select_diverse_beam(candidates: list[CandidateEvaluation], *, width: int, min_families: int) -> list[CandidateEvaluation]:
+    ranked = sorted(candidates, key=lambda item: (item.search_score, item.score), reverse=True)
+    if not ranked:
+        return []
+    beam: list[CandidateEvaluation] = []
+    family_buckets: dict[str, list[CandidateEvaluation]] = {}
+    for candidate in ranked:
+        family_buckets.setdefault(candidate.family_signature, []).append(candidate)
+    for family in list(family_buckets)[:min_families]:
+        beam.append(family_buckets[family][0])
+    seen = {candidate.topology_fingerprint for candidate in beam}
+    for candidate in ranked:
+        if len(beam) >= width:
+            break
+        if candidate.topology_fingerprint not in seen:
+            beam.append(candidate)
+            seen.add(candidate.topology_fingerprint)
+    return beam[:width]
+
+
+def _dedupe_edits(edits: list[CandidateEdit]) -> list[CandidateEdit]:
+    seen = set()
+    unique = []
+    for edit in edits:
+        key = (
+            edit.edit_type,
+            edit.target_node_id,
+            edit.new_node_type.value if edit.new_node_type else None,
+            edit.module_role,
+            tuple(edit.branch_labels or []),
+            edit.rewrite_instruction,
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(edit)
+    return unique
+
+
+def _dedupe_proposals(proposals: list[tuple[PromptProgram, str, str]]) -> list[tuple[PromptProgram, str, str]]:
+    seen = set()
+    unique = []
+    for program, parent_id, edit_applied in proposals:
+        fingerprint = topology_fingerprint(program)
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            unique.append((program, parent_id, edit_applied))
+    return unique
+
+
+def _dedupe_confirmed(candidates: list[CandidateEvaluation]) -> list[CandidateEvaluation]:
+    seen = {}
+    for candidate in candidates:
+        seen[candidate.topology_fingerprint] = candidate
+    return list(seen.values())
+
+
+def _archive_record(candidate: CandidateEvaluation, *, round_index: int) -> CandidateArchiveRecord:
+    screening_score = candidate.score if candidate.stage == "screening" else None
+    narrowing_score = candidate.score if candidate.stage == "narrowing" else None
+    confirmation_score = candidate.score if candidate.stage == "confirmation" else None
+    return CandidateArchiveRecord(
+        program_id=candidate.program.program_id,
+        parent_id=candidate.parent_id,
+        edit_applied=candidate.edit_applied,
+        topology_fingerprint=candidate.topology_fingerprint,
+        family_signature=candidate.family_signature,
+        screening_score=screening_score,
+        narrowing_score=narrowing_score,
+        confirmation_score=confirmation_score,
+        search_score=candidate.search_score,
+        complexity=candidate.complexity,
+        inference_cost=candidate.mean_invocations,
+        parse_failure_rate=candidate.parse_failure_rate,
+        round_index=round_index,
+        metadata={"stage": candidate.stage},
+    )
+
+
+def _induce_route_diagnostics(
+    *,
+    program: PromptProgram,
+    task_spec: TaskSpec,
+    examples: list[Example],
+    base_traces: list,
+    metric_fn: MetricFn,
+    backend: LLMBackend,
+    config: TopoPromptConfig,
+    budget: BudgetLedger,
+) -> list[RouteDiagnostic]:
+    route_nodes = [node for node in program.nodes if node.node_type.value == "route" and node.route_spec]
+    if not route_nodes:
+        return []
+    route_node = route_nodes[0]
+    base_by_example = {trace.example_id: trace for trace in base_traces}
+    diagnostics: list[RouteDiagnostic] = []
+    executor = ProgramExecutor(backend=backend, config=config, budget_ledger=budget)
+    for example in examples:
+        base_trace = base_by_example.get(example.example_id)
+        chosen_branch = None
+        chosen_score = 0.0
+        if base_trace is not None:
+            for node_trace in base_trace.node_traces:
+                if node_trace.node_id == route_node.node_id:
+                    chosen_branch = node_trace.route_choice
+                    break
+            chosen_score = base_trace.correctness or 0.0
+        branch_scores = {}
+        for branch in route_node.route_spec.branch_labels:
+            if not budget.can_spend("reserve", 1):
+                break
+            try:
+                forced = executor.run_program(
+                    program=program,
+                    task_spec=task_spec,
+                    example_id=example.example_id,
+                    task_input=example.input,
+                    phase="reserve",
+                    force_route_choices={route_node.node_id: branch},
+                )
+            except BudgetExhausted:
+                break
+            branch_scores[branch] = metric_fn(forced.trace.final_output, example)
+        if branch_scores:
+            oracle_branch = max(branch_scores, key=branch_scores.get)
+            diagnostics.append(
+                RouteDiagnostic(
+                    example_id=example.example_id,
+                    route_node_id=route_node.node_id,
+                    chosen_branch=chosen_branch,
+                    oracle_branch=oracle_branch,
+                    branch_scores=branch_scores,
+                    regret=branch_scores[oracle_branch] - chosen_score,
+                    confidence=None,
+                )
+            )
+    return diagnostics
+
+
+def _llm_guided_edit_proposals(
+    *,
+    parent: CandidateEvaluation,
+    analysis: TaskAnalysis,
+    backend: LLMBackend,
+    config: TopoPromptConfig,
+    budget: BudgetLedger,
+) -> list[CandidateEdit]:
+    if not budget.spend("screening", 1):
+        return []
+    program_summary = {
+        "program_id": parent.program.program_id,
+        "family": parent.family_signature,
+        "nodes": [node.node_type.value for node in parent.program.nodes],
+        "search_score": parent.search_score,
+    }
+    diagnostics = {
+        "score": parent.score,
+        "parse_failure_rate": parent.parse_failure_rate,
+        "mean_invocations": parent.mean_invocations,
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "proposals": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "edit_type": {"type": "string"},
+                        "target_node_id": {"type": ["string", "null"]},
+                        "new_node_type": {"type": ["string", "null"]},
+                        "module_role": {"type": ["string", "null"]},
+                        "branch_labels": {"type": ["array", "null"]},
+                        "rewrite_instruction": {"type": ["string", "null"]},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["edit_type", "reason"],
+                },
+            }
+        },
+        "required": ["proposals"],
+    }
+    try:
+        response = backend.generate_structured(
+            system_prompt="You are proposing the next structural edit for a prompt-program compiler.",
+            user_prompt=(
+                f"Task summary:\n{analysis.model_dump_json(indent=2)}\n\n"
+                f"Current program summary:\n{json.dumps(program_summary, indent=2)}\n\n"
+                f"Current diagnostics:\n{json.dumps(diagnostics, indent=2)}\n\n"
+                "Allowed edit operators:\n"
+                "- add_node\n- delete_node\n- replace_node_type\n- insert_verify_after\n- insert_plan_before\n"
+                "- split_with_route\n- remove_route\n- swap_branch_target\n- rewrite_prompt_module\n"
+                "- add_fewshot_module\n- drop_fewshot_module\n- change_finalize_format\n\n"
+                f"Hard constraints:\n- graph must remain a DAG\n- exactly one finalize node\n- max nodes: {config.program.max_nodes}\n"
+                f"- max route nodes: {config.program.max_route_nodes}\n- max branch fanout: {config.program.max_branch_fanout}\n"
+            ),
+            schema=schema,
+            model=config.model.name,
+            temperature=0.0,
+            max_output_tokens=config.model.max_output_tokens,
+        )
+        payload = response.structured or json.loads(response.text)
+        proposals = []
+        for raw in payload.get("proposals", [])[: config.compile.llm_edit_proposals_per_parent]:
+            if raw.get("new_node_type"):
+                raw["new_node_type"] = raw["new_node_type"]
+            proposals.append(CandidateEdit.model_validate(raw))
+        return proposals
+    except Exception:
+        return []
+
+
+def _validate_candidate(program: PromptProgram, config: TopoPromptConfig) -> bool:
+    try:
+        validate_program(program, config.program)
+        return True
+    except ProgramValidationError:
+        return False
+

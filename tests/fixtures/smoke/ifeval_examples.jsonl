@@ -1,0 +1,7 @@
+{"example_id":"ifeval_1","question":"Say hello to the user.","required_phrase":"HELLO","target":"HELLO Say hello to the user."}
+{"example_id":"ifeval_2","question":"Say welcome to the user.","required_phrase":"WELCOME","target":"WELCOME Say welcome to the user."}
+{"example_id":"ifeval_3","question":"Say thanks to the user.","required_phrase":"THANKS","target":"THANKS Say thanks to the user."}
+{"example_id":"ifeval_4","question":"Say hello to the user.","required_phrase":"HELLO","target":"HELLO Say hello to the user."}
+{"example_id":"ifeval_5","question":"Say welcome to the user.","required_phrase":"WELCOME","target":"WELCOME Say welcome to the user."}
+{"example_id":"ifeval_6","question":"Say thanks to the user.","required_phrase":"THANKS","target":"THANKS Say thanks to the user."}
+

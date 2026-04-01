@@ -1,0 +1,7 @@
+{"example_id":"bbh_1","question":"Which option gives the result of 2 + 3?","choices":[{"label":"A","text":"5"},{"label":"B","text":"6"},{"label":"C","text":"7"},{"label":"D","text":"4"}],"target":"A"}
+{"example_id":"bbh_2","question":"Which option gives the result of 4 + 4?","choices":[{"label":"A","text":"8"},{"label":"B","text":"9"},{"label":"C","text":"7"},{"label":"D","text":"6"}],"target":"A"}
+{"example_id":"bbh_3","question":"Which option gives the result of 10 - 3?","choices":[{"label":"A","text":"7"},{"label":"B","text":"8"},{"label":"C","text":"6"},{"label":"D","text":"5"}],"target":"A"}
+{"example_id":"bbh_4","question":"Which option gives the result of 3 * 2?","choices":[{"label":"A","text":"6"},{"label":"B","text":"5"},{"label":"C","text":"7"},{"label":"D","text":"4"}],"target":"A"}
+{"example_id":"bbh_5","question":"Which option gives the result of 9 - 4?","choices":[{"label":"A","text":"5"},{"label":"B","text":"4"},{"label":"C","text":"6"},{"label":"D","text":"7"}],"target":"A"}
+{"example_id":"bbh_6","question":"Which option gives the result of 6 + 1?","choices":[{"label":"A","text":"7"},{"label":"B","text":"8"},{"label":"C","text":"6"},{"label":"D","text":"5"}],"target":"A"}
+

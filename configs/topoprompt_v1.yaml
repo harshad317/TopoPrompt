@@ -1,0 +1,64 @@
+model:
+  name: gpt-4.1-mini
+  repair_model: null
+  embedding_model: text-embedding-3-small
+  temperature: 0.0
+  max_output_tokens: 800
+
+compile:
+  budget_unit: llm_invocation
+  total_budget_calls: 500
+  analyzer_budget_calls: 20
+  seed_budget_calls: 60
+  screening_budget_calls: 240
+  narrowing_budget_calls: 110
+  confirmation_budget_calls: 50
+  reserve_budget_calls: 20
+  beam_width: 8
+  max_rounds: 6
+  max_candidates_per_parent: 6
+  min_structural_families: 2
+  confirm_top_k: 3
+  early_stop_min_improvement: 0.005
+  early_stop_patience_rounds: 2
+  target_score: null
+  screening_examples: 8
+  narrowing_examples: 32
+  confirmation_examples: 64
+  always_include_direct_seed: true
+  reseed_margin: 0.04
+  llm_edit_proposals_per_parent: 2
+  llm_edit_proposals_enabled: true
+
+program:
+  max_nodes: 7
+  max_route_nodes: 2
+  max_branch_fanout: 3
+  max_subquestions_per_decompose: 3
+  allow_loops: false
+  prompt_token_cap: 1500
+
+data:
+  official_test_split: true
+  compile_fraction_if_no_official_split: 0.60
+  validation_fraction_if_no_official_split: 0.20
+  test_fraction_if_no_official_split: 0.20
+  fewshot_pool_fraction_of_compile: 0.10
+  fewshot_pool_max_examples: 32
+  representative_examples_for_analysis: 5
+
+objective:
+  alpha_cost: 0.05
+  beta_complexity: 0.10
+  gamma_parse_failure: 0.20
+  epsilon_mode: variance_adaptive
+  epsilon_floor: 0.01
+  epsilon_z: 1.0
+
+runtime:
+  parser_retry_limit: 1
+  parser_repair_limit: 1
+  cache_enabled: true
+  cache_dir: ".topoprompt_cache"
+  route_mode_default: self_route_llm
+
