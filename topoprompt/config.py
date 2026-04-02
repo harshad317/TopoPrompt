@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -52,6 +52,7 @@ class CompileConfig(BaseModel):
     reseed_margin: float = 0.04
     llm_edit_proposals_per_parent: int = 2
     llm_edit_proposals_enabled: bool = True
+    final_program_policy: Literal["best", "smallest_effective"] = "best"
 
     def phase_budget_total(self) -> int:
         return sum(getattr(self, field_name) for field_name in COMPILE_BUDGET_PHASE_FIELDS)

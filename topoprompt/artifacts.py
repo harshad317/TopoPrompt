@@ -50,8 +50,9 @@ def write_compile_artifact(artifact: CompileArtifact, output_dir: str | Path) ->
         save_program_yaml(artifact.best_program_ir, out_dir / "best_program.yaml")
     _write_json(out_dir / "final_program.json", artifact.program_ir.model_dump(mode="json"))
     save_program_yaml(artifact.program_ir, out_dir / "final_program.yaml")
-    _write_json(out_dir / "smallest_effective_program.json", artifact.program_ir.model_dump(mode="json"))
-    save_program_yaml(artifact.program_ir, out_dir / "smallest_effective_program.yaml")
+    smallest_effective_program = artifact.smallest_effective_program_ir or artifact.program_ir
+    _write_json(out_dir / "smallest_effective_program.json", smallest_effective_program.model_dump(mode="json"))
+    save_program_yaml(smallest_effective_program, out_dir / "smallest_effective_program.yaml")
     save_compile_traces_jsonl(artifact.compile_trace, out_dir / "compile_trace.jsonl")
     _write_jsonl(out_dir / "candidate_archive.jsonl", [record.model_dump(mode="json") for record in artifact.candidate_archive])
     _write_json(out_dir / "metrics.json", artifact.metrics.model_dump(mode="json"))
@@ -69,8 +70,10 @@ def _render_summary(artifact: CompileArtifact) -> str:
         f"- Task: `{artifact.task_spec.task_id}`",
         f"- Best program: `{metrics.best_program_id}`",
         f"- Smallest effective program: `{metrics.smallest_effective_program_id}`",
+        f"- Final exported program: `{metrics.final_program_id}` (`{metrics.final_program_policy}` policy)",
         f"- Best validation score: `{metrics.best_validation_score:.4f}`",
         f"- Smallest effective score: `{metrics.smallest_effective_score:.4f}`",
+        f"- Final exported score: `{metrics.final_program_score:.4f}`",
         f"- Epsilon: `{metrics.epsilon:.4f}`",
         f"- Winning topology family: `{metrics.winning_topology_family}`",
         f"- Planned budget calls: `{metrics.planned_budget_calls}`",

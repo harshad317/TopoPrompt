@@ -5,6 +5,7 @@ from pathlib import Path
 from topoprompt.compiler.search import (
     _budgeted_stage_example_cap,
     _select_affordable_confirmation_candidates,
+    _select_final_candidate,
     _select_final_selection_pool,
     compile_task,
     evaluate_program_on_examples,
@@ -29,6 +30,7 @@ def test_compile_task_runs_end_to_end(fake_backend, small_config, gsm8k_examples
     )
     assert artifact.program_ir.program_id
     assert artifact.metrics.best_validation_score >= 0.0
+    assert artifact.metrics.final_program_id == artifact.program_ir.program_id
     assert (tmp_path / "run" / "final_program.json").exists()
     assert (tmp_path / "run" / "best_program.json").exists()
     assert (tmp_path / "run" / "smallest_effective_program.json").exists()
@@ -205,6 +207,106 @@ def test_final_selection_prefers_partial_confirmation_with_sufficient_evidence()
 
     assert used_fallback is True
     assert [candidate.program.program_id for candidate in pool] == ["partially_confirmed"]
+
+
+def test_final_program_policy_defaults_to_best_candidate():
+    config = TopoPromptConfig()
+    best_program = PromptProgram(
+        program_id="best_program",
+        task_id="task",
+        nodes=[],
+        edges=[],
+        entry_node_id="entry",
+        finalize_node_id="finalize",
+    )
+    smallest_program = PromptProgram(
+        program_id="smallest_program",
+        task_id="task",
+        nodes=[],
+        edges=[],
+        entry_node_id="entry",
+        finalize_node_id="finalize",
+    )
+    best_candidate = CandidateEvaluation(
+        program=best_program,
+        topology_fingerprint="best",
+        family_signature="plan",
+        stage="confirmation",
+        score=0.8,
+        search_score=0.8,
+        mean_invocations=3.0,
+        mean_tokens=100.0,
+        complexity=0.18,
+    )
+    smallest_candidate = CandidateEvaluation(
+        program=smallest_program,
+        topology_fingerprint="smallest",
+        family_signature="direct",
+        stage="confirmation",
+        score=0.79,
+        search_score=0.79,
+        mean_invocations=1.0,
+        mean_tokens=80.0,
+        complexity=0.08,
+    )
+
+    selected = _select_final_candidate(
+        best_candidate=best_candidate,
+        smallest_effective=smallest_candidate,
+        config=config,
+    )
+
+    assert selected.program.program_id == "best_program"
+
+
+def test_final_program_policy_can_export_smallest_effective():
+    config = TopoPromptConfig.model_validate({"compile": {"final_program_policy": "smallest_effective"}})
+    best_program = PromptProgram(
+        program_id="best_program",
+        task_id="task",
+        nodes=[],
+        edges=[],
+        entry_node_id="entry",
+        finalize_node_id="finalize",
+    )
+    smallest_program = PromptProgram(
+        program_id="smallest_program",
+        task_id="task",
+        nodes=[],
+        edges=[],
+        entry_node_id="entry",
+        finalize_node_id="finalize",
+    )
+    best_candidate = CandidateEvaluation(
+        program=best_program,
+        topology_fingerprint="best",
+        family_signature="plan",
+        stage="confirmation",
+        score=0.8,
+        search_score=0.8,
+        mean_invocations=3.0,
+        mean_tokens=100.0,
+        complexity=0.18,
+    )
+    smallest_candidate = CandidateEvaluation(
+        program=smallest_program,
+        topology_fingerprint="smallest",
+        family_signature="direct",
+        stage="confirmation",
+        score=0.79,
+        search_score=0.79,
+        mean_invocations=1.0,
+        mean_tokens=80.0,
+        complexity=0.08,
+    )
+
+    selected = _select_final_candidate(
+        best_candidate=best_candidate,
+        smallest_effective=smallest_candidate,
+        config=config,
+    )
+
+    assert selected.program.program_id == "smallest_program"
 
 
 def test_affordable_confirmation_selection_preserves_top_ranked_prefix(simple_task_spec):

@@ -308,7 +308,12 @@ def compile_task(
         selection_candidates,
         objective_config=config.objective,
     )
-    route_accuracy, route_regret = aggregate_route_metrics(smallest_effective.traces)
+    final_candidate = _select_final_candidate(
+        best_candidate=best_candidate,
+        smallest_effective=smallest_effective,
+        config=config,
+    )
+    route_accuracy, route_regret = aggregate_route_metrics(final_candidate.traces)
     reporter.rule("Final Selection", level=1, style="bold green")
     if used_search_fallback:
         reporter.log(
@@ -320,6 +325,7 @@ def compile_task(
         prefix="Smallest fallback " if used_search_fallback else "Smallest effective ",
         level=1,
     )
+    reporter.log_candidate(final_candidate, prefix="Final exported ", level=1)
     reporter.log(f"epsilon={epsilon:.4f} route_accuracy={route_accuracy} route_regret={route_regret}")
 
     metrics = CompileMetrics(
@@ -327,6 +333,9 @@ def compile_task(
         best_validation_score=best_candidate.score,
         smallest_effective_program_id=smallest_effective.program.program_id,
         smallest_effective_score=smallest_effective.score,
+        final_program_id=final_candidate.program.program_id,
+        final_program_score=final_candidate.score,
+        final_program_policy=config.compile.final_program_policy,
         epsilon=epsilon,
         planned_budget_calls=budget.planned_total(),
         spent_budget_calls=budget.spent_total(),
@@ -335,18 +344,19 @@ def compile_task(
             for phase in budget.snapshot()
         ],
         spent_budget_by_phase=budget.snapshot(),
-        winning_topology_family=smallest_effective.family_signature,
+        winning_topology_family=final_candidate.family_signature,
         beam_family_count_by_round=beam_family_count_by_round,
-        parser_failure_rate=smallest_effective.parse_failure_rate,
+        parser_failure_rate=final_candidate.parse_failure_rate,
         route_accuracy=route_accuracy,
         route_regret=route_regret,
     )
-    dspy_program = compile_to_dspy(program=smallest_effective.program, task_spec=task_spec, config=config, backend=backend)
+    dspy_program = compile_to_dspy(program=final_candidate.program, task_spec=task_spec, config=config, backend=backend)
     artifact = CompileArtifact(
         task_spec=task_spec,
         best_program_ir=best_candidate.program,
-        program_ir=smallest_effective.program,
-        python_program=smallest_effective.program,
+        smallest_effective_program_ir=smallest_effective.program,
+        program_ir=final_candidate.program,
+        python_program=final_candidate.program,
         dspy_program=dspy_program,
         seed_programs=seed_programs,
         candidate_archive=archive_records,
@@ -768,6 +778,17 @@ def _estimate_confirmation_calls(
 ) -> int:
     target_examples = min(len(validation_examples), config.compile.confirmation_examples)
     return _estimate_program_invocations_per_example(program, config) * target_examples
+
+
+def _select_final_candidate(
+    *,
+    best_candidate: CandidateEvaluation,
+    smallest_effective: CandidateEvaluation,
+    config: TopoPromptConfig,
+) -> CandidateEvaluation:
+    if config.compile.final_program_policy == "smallest_effective":
+        return smallest_effective
+    return best_candidate
 
 
 def _select_affordable_confirmation_candidates(

@@ -199,6 +199,9 @@ class CompileMetrics(BaseModel):
     best_validation_score: float
     smallest_effective_program_id: str
     smallest_effective_score: float
+    final_program_id: str
+    final_program_score: float
+    final_program_policy: str
     epsilon: float
     planned_budget_calls: int
     spent_budget_calls: int
@@ -216,6 +219,7 @@ class CompileArtifact(BaseModel):
 
     task_spec: TaskSpec
     best_program_ir: PromptProgram | None = None
+    smallest_effective_program_ir: PromptProgram | None = None
     program_ir: PromptProgram
     python_program: Any | None = None
     dspy_program: Any | None = None

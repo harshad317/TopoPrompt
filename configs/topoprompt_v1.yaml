@@ -32,6 +32,7 @@ compile:
   reseed_margin: 0.04
   llm_edit_proposals_per_parent: 2
   llm_edit_proposals_enabled: true
+  final_program_policy: best
 
 program:
   max_nodes: 7

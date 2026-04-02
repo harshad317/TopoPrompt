@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -166,13 +167,19 @@ class ProgramExecutor:
     ) -> NodeExecutionTrace:
         parsed_output: dict[str, Any]
         if node.node_type == NodeType.FINALIZE:
-            source_key = node.config.get("source_key")
-            if source_key is None:
-                for key in ["candidate_answer", "verification_result", "plan"]:
-                    if key in state:
-                        source_key = key
-                        break
-            parsed_output = {"final_answer": state.get(source_key) if source_key else state.get("final_answer")}
+            finalize_mode = node.config.get("mode")
+            if finalize_mode == "majority_vote":
+                source_keys = list(node.config.get("source_keys") or [])
+                votes = [state.get(key) for key in source_keys if state.get(key) is not None]
+                parsed_output = {"final_answer": _majority_vote(votes)}
+            else:
+                source_key = node.config.get("source_key")
+                if source_key is None:
+                    for key in ["candidate_answer", "verification_result", "plan"]:
+                        if key in state:
+                            source_key = key
+                            break
+                parsed_output = {"final_answer": state.get(source_key) if source_key else state.get("final_answer")}
         else:
             parsed_output = {}
             for output_key in node.output_keys:
@@ -306,6 +313,9 @@ class ProgramExecutor:
                 invocation_cost=0 if cache_hit else 1,
             )
 
+        if isinstance(parsed_output, dict):
+            parsed_output = _apply_output_aliases(node=node, parsed_output=parsed_output)
+
         return NodeExecutionTrace(
             node_id=node.node_id,
             prompt_text=user_prompt,
@@ -327,3 +337,42 @@ class ProgramExecutor:
         allow_reserve = phase in {"confirmation", "analyzer"}
         if not self.budget_ledger.spend(phase, calls, allow_reserve=allow_reserve):
             raise BudgetExhausted(f"Budget exhausted for phase '{phase}'")
+
+
+def _apply_output_aliases(*, node: ProgramNode, parsed_output: dict[str, Any]) -> dict[str, Any]:
+    alias_map = node.config.get("output_alias_map") or {}
+    if not alias_map:
+        return parsed_output
+    remapped = dict(parsed_output)
+    for source_key, target_key in alias_map.items():
+        if source_key not in remapped:
+            continue
+        remapped[target_key] = remapped.pop(source_key)
+    return remapped
+
+
+def _majority_vote(values: list[Any]) -> Any | None:
+    if not values:
+        return None
+    grouped: dict[str, list[Any]] = {}
+    key_order: list[str] = []
+    for value in values:
+        vote_key = _normalize_vote_key(value)
+        if vote_key not in grouped:
+            grouped[vote_key] = []
+            key_order.append(vote_key)
+        grouped[vote_key].append(value)
+
+    winning_key = max(key_order, key=lambda key: (len(grouped[key]), -key_order.index(key)))
+    winners = grouped[winning_key]
+    return min(winners, key=lambda item: (len(str(item).strip()), str(item).strip().lower()))
+
+
+def _normalize_vote_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    number_match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if number_match:
+        return number_match.group(0)
+    return re.sub(r"\s+", " ", text)

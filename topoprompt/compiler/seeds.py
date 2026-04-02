@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from topoprompt.compiler.templates import create_node, default_prompt_modules
-from topoprompt.schemas import NodeType, ProgramEdge, PromptProgram, RouteSpec, TaskAnalysis, TaskSpec
+from topoprompt.schemas import NodeType, ProgramEdge, PromptModule, PromptProgram, RouteSpec, TaskAnalysis, TaskSpec
 
 
 SEED_LIBRARY = [
@@ -31,6 +31,71 @@ def instantiate_seed_programs(
         if program is not None:
             seeds.append(program)
     return seeds
+
+
+def instantiate_direct_self_consistency_program(
+    *,
+    task_spec: TaskSpec,
+    analysis: TaskAnalysis,
+    attempts: int = 3,
+    program_id: str | None = None,
+) -> PromptProgram:
+    if attempts < 2:
+        raise ValueError("Self-consistency baseline requires at least 2 attempts.")
+
+    nodes = []
+    edges: list[ProgramEdge] = []
+    answer_keys: list[str] = []
+    previous_node_id: str | None = None
+
+    for attempt_index in range(1, attempts + 1):
+        answer_key = f"candidate_answer_{attempt_index}"
+        rationale_key = f"rationale_{attempt_index}"
+        answer_keys.append(answer_key)
+        direct_node = create_node(
+            node_id=f"direct_{attempt_index}",
+            node_type=NodeType.DIRECT,
+            input_keys=["task_input"],
+            output_keys=[answer_key, rationale_key],
+            config={
+                "output_alias_map": {
+                    "candidate_answer": answer_key,
+                    "rationale": rationale_key,
+                }
+            },
+            prompt_modules=[
+                *default_prompt_modules(NodeType.DIRECT, task_analysis=analysis),
+                PromptModule(
+                    role="instruction",
+                    text=f"This is independent attempt {attempt_index} of {attempts}. Do not reference prior attempts.",
+                ),
+            ],
+            task_analysis=analysis,
+        )
+        nodes.append(direct_node)
+        if previous_node_id is not None:
+            edges.append(ProgramEdge(source=previous_node_id, target=direct_node.node_id))
+        previous_node_id = direct_node.node_id
+
+    finalize = create_node(
+        "finalize_1",
+        NodeType.FINALIZE,
+        input_keys=answer_keys,
+        config={"mode": "majority_vote", "source_keys": answer_keys},
+    )
+    nodes.append(finalize)
+    assert previous_node_id is not None
+    edges.append(ProgramEdge(source=previous_node_id, target="finalize_1"))
+
+    return PromptProgram(
+        program_id=program_id or f"direct_self_consistency_x{attempts}",
+        task_id=task_spec.task_id,
+        nodes=nodes,
+        edges=edges,
+        entry_node_id=nodes[0].node_id,
+        finalize_node_id="finalize_1",
+        metadata={"seed_template": "direct_self_consistency", "attempts": attempts},
+    )
 
 
 def instantiate_seed_program(*, task_spec: TaskSpec, analysis: TaskAnalysis, template_name: str) -> PromptProgram | None:
@@ -63,6 +128,13 @@ def instantiate_seed_program(*, task_spec: TaskSpec, analysis: TaskAnalysis, tem
                 entry_node_id="direct_1",
                 finalize_node_id="finalize_1",
                 metadata={"seed_template": template_name},
+            )
+        case "direct_self_consistency_x3":
+            return instantiate_direct_self_consistency_program(
+                task_spec=task_spec,
+                analysis=analysis,
+                attempts=3,
+                program_id=template_name,
             )
         case "plan_solve_finalize":
             plan = create_node("plan_1", NodeType.PLAN, input_keys=["task_input"], task_analysis=analysis)
@@ -209,4 +281,3 @@ def instantiate_seed_program(*, task_spec: TaskSpec, analysis: TaskAnalysis, tem
                 metadata={"seed_template": template_name},
             )
     return None
-

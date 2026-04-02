@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from topoprompt.backends.llm_client import FakeBackend
 from topoprompt.compiler.seeds import instantiate_seed_program
 from topoprompt.eval.metrics import numeric_metric
 from topoprompt.runtime.executor import ProgramExecutor
@@ -41,6 +42,46 @@ def test_parser_falls_back_to_repair(fake_backend):
     )
     assert parsed["candidate_answer"] == "42"
     assert repair_used is False
+
+
+def test_runtime_executes_direct_self_consistency_majority_vote(small_config, simple_task_spec):
+    responses = iter(["11", "12", "12"])
+
+    def structured_handler(_system_prompt: str, _user_prompt: str, _schema: dict[str, object]) -> dict[str, str]:
+        return {"candidate_answer": next(responses)}
+
+    backend = FakeBackend(structured_handler=structured_handler)
+    analysis = TaskAnalysis(
+        needs_reasoning=False,
+        initial_seed_templates=["direct_self_consistency_x3"],
+    )
+    program = instantiate_seed_program(
+        task_spec=simple_task_spec,
+        analysis=analysis,
+        template_name="direct_self_consistency_x3",
+    )
+    assert program is not None
+
+    executor = ProgramExecutor(backend=backend, config=small_config)
+    result = executor.run_program(
+        program=program,
+        task_spec=simple_task_spec,
+        example_id="consensus_case",
+        task_input={"question": "What is 6 + 6?"},
+        phase="confirmation",
+    )
+
+    assert result.trace.final_output == "12"
+    assert result.trace.total_invocations == 3
+    assert [trace.node_id for trace in result.trace.node_traces] == [
+        "direct_1",
+        "direct_2",
+        "direct_3",
+        "finalize_1",
+    ]
+    assert result.state["candidate_answer_1"] == "11"
+    assert result.state["candidate_answer_2"] == "12"
+    assert result.state["candidate_answer_3"] == "12"
 
 
 def test_gsm8k_metric_uses_final_answer_marker():
