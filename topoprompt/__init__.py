@@ -1,4 +1,5 @@
 from topoprompt.config import TopoPromptConfig, load_config
+from topoprompt.eval.compare import compare_programs
 from topoprompt.schemas import CompileArtifact, Example, PromptProgram, TaskSpec
 
 
@@ -13,6 +14,7 @@ __all__ = [
     "PromptProgram",
     "TaskSpec",
     "TopoPromptConfig",
+    "compare_programs",
     "compile_task",
     "load_config",
 ]

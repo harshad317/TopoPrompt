@@ -45,6 +45,9 @@ class CompileConfig(BaseModel):
     screening_examples: int = 8
     narrowing_examples: int = 32
     confirmation_examples: int = 64
+    min_screening_examples_for_fallback: int = 4
+    min_narrowing_examples_for_fallback: int = 8
+    min_confirmation_examples_for_fallback: int = 8
     always_include_direct_seed: bool = True
     reseed_margin: float = 0.04
     llm_edit_proposals_per_parent: int = 2

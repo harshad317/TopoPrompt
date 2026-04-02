@@ -30,6 +30,8 @@ def test_compile_task_runs_end_to_end(fake_backend, small_config, gsm8k_examples
     assert artifact.program_ir.program_id
     assert artifact.metrics.best_validation_score >= 0.0
     assert (tmp_path / "run" / "final_program.json").exists()
+    assert (tmp_path / "run" / "best_program.json").exists()
+    assert (tmp_path / "run" / "smallest_effective_program.json").exists()
     assert artifact.candidate_archive
 
 
@@ -76,6 +78,7 @@ def test_evaluate_program_runs_full_dataset_without_compile_budget_cap(fake_back
 
 
 def test_final_selection_falls_back_to_beam_instead_of_screening_seed():
+    config = TopoPromptConfig()
     baseline_program = PromptProgram(
         program_id="direct_finalize",
         task_id="task",
@@ -111,6 +114,7 @@ def test_final_selection_falls_back_to_beam_instead_of_screening_seed():
         mean_invocations=1.0,
         mean_tokens=390.0,
         complexity=0.086,
+        metadata={"examples_evaluated": 4, "target_examples": 4},
     )
     beam_candidate = CandidateEvaluation(
         program=beam_program,
@@ -122,6 +126,7 @@ def test_final_selection_falls_back_to_beam_instead_of_screening_seed():
         mean_invocations=2.0,
         mean_tokens=799.0,
         complexity=0.140,
+        metadata={"examples_evaluated": 8, "target_examples": 8},
     )
     partial_confirmation = CandidateEvaluation(
         program=partial_confirmation_program,
@@ -140,10 +145,66 @@ def test_final_selection_falls_back_to_beam_instead_of_screening_seed():
         finalists=[partial_confirmation],
         beam=[beam_candidate],
         seed_evals=[screening_seed],
+        config=config,
     )
 
     assert used_fallback is True
     assert [candidate.program.program_id for candidate in pool] == ["plan_solve_finalize_best"]
+
+
+def test_final_selection_prefers_partial_confirmation_with_sufficient_evidence():
+    config = TopoPromptConfig()
+    beam_program = PromptProgram(
+        program_id="screening_fluke",
+        task_id="task",
+        nodes=[],
+        edges=[],
+        entry_node_id="entry",
+        finalize_node_id="finalize",
+    )
+    partial_confirmation_program = PromptProgram(
+        program_id="partially_confirmed",
+        task_id="task",
+        nodes=[],
+        edges=[],
+        entry_node_id="entry",
+        finalize_node_id="finalize",
+    )
+
+    beam_candidate = CandidateEvaluation(
+        program=beam_program,
+        topology_fingerprint="beam",
+        family_signature="plan-solve",
+        stage="screening",
+        score=1.0,
+        search_score=0.95,
+        mean_invocations=2.0,
+        mean_tokens=800.0,
+        complexity=0.14,
+        metadata={"examples_evaluated": 1, "target_examples": 1},
+    )
+    partial_confirmation = CandidateEvaluation(
+        program=partial_confirmation_program,
+        topology_fingerprint="partial",
+        family_signature="plan-solve",
+        stage="confirmation",
+        score=0.6,
+        search_score=0.58,
+        mean_invocations=2.0,
+        mean_tokens=810.0,
+        complexity=0.14,
+        metadata={"fully_evaluated": False, "examples_evaluated": 10, "target_examples": 12},
+    )
+
+    pool, used_fallback = _select_final_selection_pool(
+        finalists=[partial_confirmation],
+        beam=[beam_candidate],
+        seed_evals=[],
+        config=config,
+    )
+
+    assert used_fallback is True
+    assert [candidate.program.program_id for candidate in pool] == ["partially_confirmed"]
 
 
 def test_affordable_confirmation_selection_preserves_top_ranked_prefix(simple_task_spec):

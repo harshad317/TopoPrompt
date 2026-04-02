@@ -45,8 +45,13 @@ def write_compile_artifact(artifact: CompileArtifact, output_dir: str | Path) ->
     save_task_spec_json(artifact.task_spec, out_dir / "task_spec.json")
     (out_dir / "config.yaml").write_text(yaml.safe_dump(artifact.config, sort_keys=False))
     _write_json(out_dir / "seed_programs.json", [seed.model_dump(mode="json") for seed in artifact.seed_programs])
+    if artifact.best_program_ir is not None:
+        _write_json(out_dir / "best_program.json", artifact.best_program_ir.model_dump(mode="json"))
+        save_program_yaml(artifact.best_program_ir, out_dir / "best_program.yaml")
     _write_json(out_dir / "final_program.json", artifact.program_ir.model_dump(mode="json"))
     save_program_yaml(artifact.program_ir, out_dir / "final_program.yaml")
+    _write_json(out_dir / "smallest_effective_program.json", artifact.program_ir.model_dump(mode="json"))
+    save_program_yaml(artifact.program_ir, out_dir / "smallest_effective_program.yaml")
     save_compile_traces_jsonl(artifact.compile_trace, out_dir / "compile_trace.jsonl")
     _write_jsonl(out_dir / "candidate_archive.jsonl", [record.model_dump(mode="json") for record in artifact.candidate_archive])
     _write_json(out_dir / "metrics.json", artifact.metrics.model_dump(mode="json"))
@@ -62,7 +67,8 @@ def _render_summary(artifact: CompileArtifact) -> str:
         "# TopoPrompt Compile Summary",
         "",
         f"- Task: `{artifact.task_spec.task_id}`",
-        f"- Winning program: `{metrics.smallest_effective_program_id}`",
+        f"- Best program: `{metrics.best_program_id}`",
+        f"- Smallest effective program: `{metrics.smallest_effective_program_id}`",
         f"- Best validation score: `{metrics.best_validation_score:.4f}`",
         f"- Smallest effective score: `{metrics.smallest_effective_score:.4f}`",
         f"- Epsilon: `{metrics.epsilon:.4f}`",

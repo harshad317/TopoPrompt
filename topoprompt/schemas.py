@@ -215,6 +215,7 @@ class CompileArtifact(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     task_spec: TaskSpec
+    best_program_ir: PromptProgram | None = None
     program_ir: PromptProgram
     python_program: Any | None = None
     dspy_program: Any | None = None
@@ -224,4 +225,3 @@ class CompileArtifact(BaseModel):
     metrics: CompileMetrics
     config: dict[str, Any] = Field(default_factory=dict)
     output_dir: str | None = None
-

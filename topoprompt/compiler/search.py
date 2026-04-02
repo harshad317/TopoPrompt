@@ -302,6 +302,7 @@ def compile_task(
         finalists=finalists,
         beam=beam,
         seed_evals=seed_evals,
+        config=config,
     )
     best_candidate, smallest_effective, epsilon, _effective = choose_smallest_effective(
         selection_candidates,
@@ -343,6 +344,7 @@ def compile_task(
     dspy_program = compile_to_dspy(program=smallest_effective.program, task_spec=task_spec, config=config, backend=backend)
     artifact = CompileArtifact(
         task_spec=task_spec,
+        best_program_ir=best_candidate.program,
         program_ir=smallest_effective.program,
         python_program=smallest_effective.program,
         dspy_program=dspy_program,
@@ -822,15 +824,52 @@ def _is_fully_evaluated(candidate: CandidateEvaluation) -> bool:
     return bool(candidate.metadata.get("fully_evaluated", False))
 
 
+def _examples_evaluated(candidate: CandidateEvaluation) -> int:
+    return int(candidate.metadata.get("examples_evaluated", len(candidate.traces)))
+
+
+def _target_examples(candidate: CandidateEvaluation) -> int:
+    target_examples = int(candidate.metadata.get("target_examples", 0))
+    return max(target_examples, _examples_evaluated(candidate), 1)
+
+
+def _fallback_evidence_threshold(candidate: CandidateEvaluation, config: TopoPromptConfig) -> int:
+    if candidate.stage == "confirmation":
+        configured_threshold = config.compile.min_confirmation_examples_for_fallback
+    elif candidate.stage == "narrowing":
+        configured_threshold = config.compile.min_narrowing_examples_for_fallback
+    else:
+        configured_threshold = config.compile.min_screening_examples_for_fallback
+    return min(max(configured_threshold, 1), _target_examples(candidate))
+
+
+def _has_fallback_evidence(candidate: CandidateEvaluation, config: TopoPromptConfig) -> bool:
+    return _examples_evaluated(candidate) >= _fallback_evidence_threshold(candidate, config)
+
+
 def _select_final_selection_pool(
     *,
     finalists: list[CandidateEvaluation],
     beam: list[CandidateEvaluation],
     seed_evals: list[CandidateEvaluation],
+    config: TopoPromptConfig,
 ) -> tuple[list[CandidateEvaluation], bool]:
     fully_confirmed = _dedupe_confirmed([candidate for candidate in finalists if _is_fully_evaluated(candidate)])
     if fully_confirmed:
         return fully_confirmed, False
+    partially_confirmed = _dedupe_confirmed(
+        [candidate for candidate in finalists if _has_fallback_evidence(candidate, config)]
+    )
+    if partially_confirmed:
+        return partially_confirmed, True
+    evidenced_beam = _dedupe_confirmed([candidate for candidate in beam if _has_fallback_evidence(candidate, config)])
+    if evidenced_beam:
+        return evidenced_beam, True
+    evidenced_seeds = _dedupe_confirmed(
+        [candidate for candidate in seed_evals if _has_fallback_evidence(candidate, config)]
+    )
+    if evidenced_seeds:
+        return evidenced_seeds, True
     fallback_pool = beam or finalists or seed_evals
     return fallback_pool, True
 
