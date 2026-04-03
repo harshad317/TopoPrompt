@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import orjson
+import pytest
 
 from topoprompt.cli import main
 from topoprompt.eval.compare import compare_programs
@@ -88,8 +89,11 @@ def test_compare_programs_writes_disagreements(tmp_path, small_config):
     assert result["score_b_mean"] == 0.0
     assert result["a_better_count_mean"] == 2.0
     assert result["b_better_count_mean"] == 0.0
+    assert result["significance"]["repeat_results"][0]["mcnemar_exact_p_value"] == 0.5
     assert (tmp_path / "compare" / "compare_summary.json").exists()
     assert (tmp_path / "compare" / "compare_summary.md").exists()
+    assert (tmp_path / "compare" / "significance_summary.json").exists()
+    assert (tmp_path / "compare" / "significance_summary.md").exists()
     assert (tmp_path / "compare" / "repeat_metrics.jsonl").exists()
     disagreement_path = tmp_path / "compare" / "disagreements_repeat_1.jsonl"
     assert disagreement_path.exists()
@@ -163,3 +167,60 @@ def test_cli_compare_smoke(fake_backend, tmp_path, monkeypatch, capsys):
     assert payload["mean_invocations_a_mean"] == 1.0
     assert payload["mean_invocations_b_mean"] == 1.0
     assert (output_dir / "compare_summary.json").exists()
+    assert (output_dir / "significance_summary.json").exists()
+
+
+def test_cli_significance_smoke(tmp_path, monkeypatch, capsys):
+    compare_dir = tmp_path / "compare_dir"
+    compare_dir.mkdir(parents=True, exist_ok=True)
+    compare_summary = {
+        "label_a": "compiled",
+        "label_b": "direct_x3",
+        "program_a_id": "compiled_program",
+        "program_b_id": "direct_program",
+        "sample_count": 10,
+        "repeats": 1,
+    }
+    repeat_row = {
+        "repeat_index": 1,
+        "program_a_id": "compiled_program",
+        "program_b_id": "direct_program",
+        "score_a": 0.7,
+        "score_b": 0.5,
+        "score_delta_a_minus_b": 0.2,
+        "score_delta_b_minus_a": -0.2,
+        "mean_invocations_a": 3.0,
+        "mean_invocations_b": 3.0,
+        "a_better_count": 3,
+        "b_better_count": 1,
+        "tied_count": 6,
+        "both_positive_count": 4,
+        "a_only_positive_count": 3,
+        "b_only_positive_count": 1,
+        "both_zero_count": 2,
+        "disagreement_count": 4,
+    }
+    (compare_dir / "compare_summary.json").write_bytes(orjson.dumps(compare_summary))
+    (compare_dir / "repeat_metrics.jsonl").write_bytes(orjson.dumps(repeat_row) + b"\n")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "topoprompt",
+            "significance",
+            "--compare-dir",
+            str(compare_dir),
+            "--bootstrap-samples",
+            "200",
+            "--bootstrap-seed",
+            "7",
+        ],
+    )
+
+    main()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["sample_count"] == 10
+    assert payload["repeat_results"][0]["discordant_pair_count"] == 4
+    assert payload["repeat_results"][0]["score_delta_a_minus_b"] == pytest.approx(0.2)
+    assert (compare_dir / "significance_summary.json").exists()

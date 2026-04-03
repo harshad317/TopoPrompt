@@ -11,6 +11,7 @@ from topoprompt.config import load_config
 from topoprompt.eval.compare import compare_programs
 from topoprompt.eval.datasets import load_examples_from_jsonl
 from topoprompt.eval.metrics import metric_for_name
+from topoprompt.eval.significance import summarize_significance_from_compare_dir
 from topoprompt.schemas import PromptProgram, TaskSpec
 
 
@@ -53,11 +54,18 @@ def main() -> None:
     compare_parser.add_argument("--quiet", action="store_true")
     compare_parser.add_argument("-v", "--verbose", action="count", default=0)
 
+    significance_parser = subparsers.add_parser("significance")
+    significance_parser.add_argument("--compare-dir", required=True)
+    significance_parser.add_argument("--output-dir", default=None)
+    significance_parser.add_argument("--confidence-level", type=float, default=0.95)
+    significance_parser.add_argument("--bootstrap-samples", type=int, default=10000)
+    significance_parser.add_argument("--bootstrap-seed", type=int, default=0)
+
     args = parser.parse_args()
-    config = load_config(args.config)
-    backend = FakeBackend() if getattr(args, "fake_backend", False) else OpenAIBackend()
+    config = load_config(getattr(args, "config", None))
 
     if args.command == "compile":
+        backend = FakeBackend() if getattr(args, "fake_backend", False) else OpenAIBackend()
         task_description = Path(args.task_file).read_text().strip()
         examples = load_examples_from_jsonl(args.examples_file)
         artifact = compile_task(
@@ -74,6 +82,7 @@ def main() -> None:
         return
 
     if args.command == "evaluate":
+        backend = FakeBackend() if getattr(args, "fake_backend", False) else OpenAIBackend()
         program = PromptProgram.model_validate_json(Path(args.program).read_text())
         examples = load_examples_from_jsonl(args.dataset)
         task_spec = _load_task_spec(args.task_spec, examples)
@@ -92,6 +101,7 @@ def main() -> None:
         return
 
     if args.command == "compare":
+        backend = FakeBackend() if getattr(args, "fake_backend", False) else OpenAIBackend()
         program_a = PromptProgram.model_validate_json(Path(args.program_a).read_text())
         program_b = PromptProgram.model_validate_json(Path(args.program_b).read_text())
         examples = load_examples_from_jsonl(args.dataset)
@@ -110,6 +120,17 @@ def main() -> None:
             output_dir=args.output_dir,
             show_progress=not args.quiet,
             progress_verbosity=1 + int(args.verbose or 0),
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "significance":
+        result = summarize_significance_from_compare_dir(
+            args.compare_dir,
+            output_dir=args.output_dir,
+            confidence_level=args.confidence_level,
+            bootstrap_samples=args.bootstrap_samples,
+            bootstrap_seed=args.bootstrap_seed,
         )
         print(json.dumps(result, indent=2))
 

@@ -1,5 +1,6 @@
 from topoprompt.config import TopoPromptConfig, load_config
 from topoprompt.eval.compare import compare_programs
+from topoprompt.eval.significance import summarize_significance_from_compare_dir
 from topoprompt.schemas import CompileArtifact, Example, PromptProgram, TaskSpec
 
 
@@ -17,4 +18,5 @@ __all__ = [
     "compare_programs",
     "compile_task",
     "load_config",
+    "summarize_significance_from_compare_dir",
 ]

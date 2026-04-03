@@ -10,6 +10,7 @@ from topoprompt.backends.llm_client import LLMBackend
 from topoprompt.compiler.search import evaluate_program_on_examples
 from topoprompt.config import TopoPromptConfig
 from topoprompt.eval.metrics import MetricFn
+from topoprompt.eval.significance import build_significance_summary, render_significance_summary
 from topoprompt.progress import CompileProgressReporter
 from topoprompt.schemas import Example, PromptProgram, TaskSpec
 
@@ -28,6 +29,9 @@ def compare_programs(
     phase: str = "confirmation",
     repeats: int = 1,
     output_dir: str | Path | None = None,
+    confidence_level: float = 0.95,
+    bootstrap_samples: int = 10000,
+    bootstrap_seed: int = 0,
     show_progress: bool = False,
     progress_verbosity: int = 1,
     progress_reporter: CompileProgressReporter | None = None,
@@ -95,6 +99,18 @@ def compare_programs(
         sample_count=len(examples),
         repeat_results=repeat_results,
     )
+    significance = build_significance_summary(
+        label_a=label_a,
+        label_b=label_b,
+        program_a_id=program_a.program_id,
+        program_b_id=program_b.program_id,
+        sample_count=len(examples),
+        repeat_results=repeat_results,
+        confidence_level=confidence_level,
+        bootstrap_samples=bootstrap_samples,
+        bootstrap_seed=bootstrap_seed,
+    )
+    summary["significance"] = significance
 
     if out_dir is not None:
         _write_json(out_dir / "compare_summary.json", summary)
@@ -102,6 +118,8 @@ def compare_programs(
         for repeat_result, disagreement_rows in zip(repeat_results, disagreement_rows_by_repeat, strict=False):
             _write_jsonl(out_dir / f"disagreements_repeat_{repeat_result['repeat_index']}.jsonl", disagreement_rows)
         (out_dir / "compare_summary.md").write_text(_render_compare_summary(summary))
+        _write_json(out_dir / "significance_summary.json", significance)
+        (out_dir / "significance_summary.md").write_text(render_significance_summary(significance))
 
     return summary
 
@@ -180,6 +198,7 @@ def _compare_repeat_results(
             "program_b_id": program_b.program_id,
             "score_a": result_a["score"],
             "score_b": result_b["score"],
+            "score_delta_a_minus_b": result_a["score"] - result_b["score"],
             "score_delta_b_minus_a": result_b["score"] - result_a["score"],
             "mean_invocations_a": result_a["mean_invocations"],
             "mean_invocations_b": result_b["mean_invocations"],
@@ -222,6 +241,8 @@ def _build_compare_summary(
         "score_a_std": _std(score_a_values),
         "score_b_mean": mean(score_b_values),
         "score_b_std": _std(score_b_values),
+        "score_delta_a_minus_b_mean": mean(float(row["score_delta_a_minus_b"]) for row in repeat_results),
+        "score_delta_a_minus_b_std": _std([float(row["score_delta_a_minus_b"]) for row in repeat_results]),
         "score_delta_b_minus_a_mean": mean(delta_values),
         "score_delta_b_minus_a_std": _std(delta_values),
         "mean_invocations_a_mean": mean(invocations_a_values),
@@ -250,6 +271,7 @@ def _render_compare_summary(summary: dict[str, Any]) -> str:
         f"- Repeats: `{summary['repeats']}`",
         f"- Score A mean/std: `{summary['score_a_mean']:.4f}` / `{summary['score_a_std']:.4f}`",
         f"- Score B mean/std: `{summary['score_b_mean']:.4f}` / `{summary['score_b_std']:.4f}`",
+        f"- Delta (A - B) mean/std: `{summary['score_delta_a_minus_b_mean']:.4f}` / `{summary['score_delta_a_minus_b_std']:.4f}`",
         f"- Delta (B - A) mean/std: `{summary['score_delta_b_minus_a_mean']:.4f}` / `{summary['score_delta_b_minus_a_std']:.4f}`",
         f"- Mean invocations A: `{summary['mean_invocations_a_mean']:.2f}`",
         f"- Mean invocations B: `{summary['mean_invocations_b_mean']:.2f}`",
