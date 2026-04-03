@@ -15,6 +15,7 @@ authors = [
 dependencies = [
   "datasets>=4.0.0",
   "diskcache>=5.6.3",
+  "langdetect>=1.0.9",
   "networkx>=3.4",
   "numpy>=2.0.0",
   "openai>=2.0.0",
