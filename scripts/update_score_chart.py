@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_PATH = ROOT / "results.tsv"
 OUTPUT_PATH = ROOT / "artifacts" / "champion_score_history.svg"
+TARGET_SCORE = 0.98086
 
 WIDTH = 960
 HEIGHT = 540
@@ -72,8 +73,8 @@ def build_svg(points):
         )
 
     scores = [point["score"] for point in points]
-    raw_min = min(scores)
-    raw_max = max(scores)
+    raw_min = min(scores + [TARGET_SCORE])
+    raw_max = max(scores + [TARGET_SCORE])
     padding = max(0.0005, (raw_max - raw_min) * 0.25 or 0.001)
     score_min = raw_min - padding
     score_max = raw_max + padding
@@ -117,6 +118,17 @@ def build_svg(points):
             f"{grid_value:.6f}</text>"
         )
 
+    target_y = to_y(TARGET_SCORE, score_min, score_max)
+    target_line = (
+        f'<line x1="{PLOT_LEFT}" y1="{target_y:.1f}" x2="{WIDTH - PLOT_RIGHT}" '
+        f'y2="{target_y:.1f}" stroke="#0f766e" stroke-width="2" stroke-dasharray="8 8" />'
+    )
+    target_label = (
+        f'<text x="{WIDTH - PLOT_RIGHT}" y="{target_y - 8:.1f}" text-anchor="end" '
+        'font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#0f766e">'
+        f"target {TARGET_SCORE:.5f}</text>"
+    )
+
     last_point = points[-1]
     subtitle = (
         f'Latest champion: {last_point["score"]:.6f} '
@@ -143,6 +155,8 @@ def build_svg(points):
         'stroke="#6b7280" stroke-width="1.5" />',
         *grid_lines,
         *y_labels,
+        target_line,
+        target_label,
         f'<polyline fill="none" stroke="#d9480f" stroke-width="3" '
         f'points="{" ".join(polyline_points)}" />',
         *circles,

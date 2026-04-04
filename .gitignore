@@ -4,6 +4,8 @@ Data/
 __pycache__/
 *.pyc
 run.log
+*.log
 results.tsv
 Predictions/
 catboost_info/
+cache/

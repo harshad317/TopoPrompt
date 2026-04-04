@@ -21,7 +21,9 @@ if os.path.isdir(_libomp_dir) and "DYLD_LIBRARY_PATH" not in os.environ:
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder, OrdinalEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import LabelEncoder, OrdinalEncoder, StandardScaler
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix, recall_score
 import lightgbm as lgb
@@ -45,6 +47,17 @@ def parse_args():
         choices=["coarse_grid", "refined_weight_search"],
         default="refined_weight_search",
     )
+    parser.add_argument(
+        "--decision-policy",
+        choices=["argmax", "class_scale_search", "logreg_stack", "mlp_stack"],
+        default="argmax",
+    )
+    parser.add_argument("--prediction-cache", default="")
+    parser.add_argument("--skip-predictions", action="store_true")
+    parser.add_argument("--categorical-crosses", action="store_true")
+    parser.add_argument("--risk-flags", action="store_true")
+    parser.add_argument("--stress-signals", action="store_true")
+    parser.add_argument("--meta-raw-features", action="store_true")
     return parser.parse_args()
 
 
@@ -65,6 +78,13 @@ print(f"Train: {train.shape}  Test: {test.shape}")
 print("Target distribution:\n", train[TARGET].value_counts())
 print(f"Run name: {ARGS.run_name}")
 print(f"Blend strategy: {ARGS.blend_strategy}")
+print(f"Decision policy: {ARGS.decision_policy}")
+if ARGS.prediction_cache:
+    print(f"Prediction cache: {ARGS.prediction_cache}")
+print(f"Categorical crosses: {ARGS.categorical_crosses}")
+print(f"Risk flags: {ARGS.risk_flags}")
+print(f"Stress signals: {ARGS.stress_signals}")
+print(f"Meta raw features: {ARGS.meta_raw_features}")
 
 # ── 2. Encode target ──────────────────────────────────────────────────────────
 
@@ -74,9 +94,17 @@ train["label"] = label_enc.transform(train[TARGET])
 
 # ── 3. Feature engineering ────────────────────────────────────────────────────
 
-CAT_COLS = [
+BASE_CAT_COLS = [
     "Soil_Type", "Crop_Type", "Crop_Growth_Stage", "Season",
     "Irrigation_Type", "Water_Source", "Mulching_Used", "Region",
+]
+CROSS_CAT_COLS = [
+    "Crop_Type__Season",
+    "Irrigation_Type__Water_Source",
+    "Soil_Type__Region",
+    "Crop_Growth_Stage__Mulching_Used",
+    "Crop_Growth_Stage__Mulching_Used__Water_Source",
+    "Crop_Growth_Stage__Mulching_Used__Irrigation_Type",
 ]
 NUM_COLS = [
     "Soil_pH", "Soil_Moisture", "Organic_Carbon", "Electrical_Conductivity",
@@ -87,9 +115,42 @@ ENG_COLS = [
     "water_stress", "et_proxy", "effective_rain", "rain_per_area",
     "prev_irr_per_ha", "aridity", "heat_index", "soil_quality",
 ]
+RISK_FLAG_COLS = [
+    "is_peak_growth_stage",
+    "is_peak_growth_without_mulch",
+    "is_peak_growth_without_mulch_river",
+    "is_peak_growth_without_mulch_canal",
+    "is_low_need_mulched_stage",
+]
+STRESS_NUM_COLS = [
+    "moisture_deficit",
+    "dry_heat",
+    "wind_heat",
+    "drought_pressure",
+    "rainfall_relief",
+    "prev_vs_rain",
+    "peak_stage_drought",
+    "peak_stage_no_mulch_drought",
+    "river_peak_no_mulch_drought",
+    "canal_peak_no_mulch_drought",
+    "stress_count",
+]
+STRESS_CAT_COLS = [
+    "Soil_Moisture_bin",
+    "Temperature_C_bin",
+    "Wind_Speed_kmh_bin",
+    "Rainfall_mm_bin",
+    "stress_count_cat",
+    "drought_pressure_bin",
+    "peak_stage_bucket",
+]
 
 def add_features(df):
     df = df.copy()
+    peak_stage = df["Crop_Growth_Stage"].isin(["Vegetative", "Flowering"])
+    no_mulch = df["Mulching_Used"].eq("No")
+    river_source = df["Water_Source"].eq("River")
+    canal_irrigation = df["Irrigation_Type"].eq("Canal")
     # High temp + low moisture + low rainfall → more irrigation needed
     df["water_stress"]    = df["Temperature_C"] / (df["Soil_Moisture"] + 1) / (df["Rainfall_mm"] + 1)
     # Evapotranspiration proxy
@@ -106,6 +167,97 @@ def add_features(df):
     df["heat_index"]      = df["Temperature_C"] * df["Humidity"] / 100
     # Soil quality (organic carbon vs salinity)
     df["soil_quality"]    = df["Organic_Carbon"] / (df["Electrical_Conductivity"] + 0.01)
+    if ARGS.risk_flags:
+        low_need_stage = df["Crop_Growth_Stage"].isin(["Sowing", "Harvest"]) & df["Mulching_Used"].eq("Yes")
+
+        df["is_peak_growth_stage"] = peak_stage.astype(np.int8)
+        df["is_peak_growth_without_mulch"] = (peak_stage & no_mulch).astype(np.int8)
+        df["is_peak_growth_without_mulch_river"] = (peak_stage & no_mulch & river_source).astype(np.int8)
+        df["is_peak_growth_without_mulch_canal"] = (peak_stage & no_mulch & canal_irrigation).astype(np.int8)
+        df["is_low_need_mulched_stage"] = low_need_stage.astype(np.int8)
+    if ARGS.stress_signals:
+        moisture_deficit = 100 - df["Soil_Moisture"]
+        drought_pressure = (
+            moisture_deficit * (df["Temperature_C"] + df["Wind_Speed_kmh"])
+            / (df["Rainfall_mm"] + 10)
+        )
+        peak_no_mulch = peak_stage & no_mulch
+
+        df["moisture_deficit"] = moisture_deficit
+        df["dry_heat"] = df["Temperature_C"] * moisture_deficit / 100
+        df["wind_heat"] = df["Temperature_C"] * df["Wind_Speed_kmh"]
+        df["drought_pressure"] = drought_pressure
+        df["rainfall_relief"] = df["Rainfall_mm"] / (df["Temperature_C"] + df["Wind_Speed_kmh"] + 1)
+        df["prev_vs_rain"] = df["Previous_Irrigation_mm"] / (df["Rainfall_mm"] + 10)
+        df["peak_stage_drought"] = drought_pressure * peak_stage.astype(np.int8)
+        df["peak_stage_no_mulch_drought"] = drought_pressure * peak_no_mulch.astype(np.int8)
+        df["river_peak_no_mulch_drought"] = drought_pressure * (
+            peak_no_mulch & river_source
+        ).astype(np.int8)
+        df["canal_peak_no_mulch_drought"] = drought_pressure * (
+            peak_no_mulch & canal_irrigation
+        ).astype(np.int8)
+        df["stress_count"] = (
+            (df["Soil_Moisture"] <= 26).astype(np.int8)
+            + (df["Temperature_C"] >= 30).astype(np.int8)
+            + (df["Wind_Speed_kmh"] >= 12).astype(np.int8)
+            + (df["Rainfall_mm"] <= 1000).astype(np.int8)
+            + peak_no_mulch.astype(np.int8)
+        )
+        df["Soil_Moisture_bin"] = pd.cut(
+            df["Soil_Moisture"],
+            bins=[-np.inf, 14.0, 20.5, 26.5, 32.5, 40.0, 50.0, np.inf],
+            labels=False,
+        ).astype(int).astype(str)
+        df["Temperature_C_bin"] = pd.cut(
+            df["Temperature_C"],
+            bins=[-np.inf, 21.0, 27.0, 30.0, 33.0, 36.0, 39.0, np.inf],
+            labels=False,
+        ).astype(int).astype(str)
+        df["Wind_Speed_kmh_bin"] = pd.cut(
+            df["Wind_Speed_kmh"],
+            bins=[-np.inf, 4.5, 8.5, 10.5, 12.5, 14.5, 18.0, np.inf],
+            labels=False,
+        ).astype(int).astype(str)
+        df["Rainfall_mm_bin"] = pd.cut(
+            df["Rainfall_mm"],
+            bins=[-np.inf, 650.0, 850.0, 1100.0, 1450.0, 1800.0, 2300.0, np.inf],
+            labels=False,
+        ).astype(int).astype(str)
+        df["drought_pressure_bin"] = pd.cut(
+            drought_pressure,
+            bins=[-np.inf, 1.0, 2.0, 3.0, 4.0, 6.0, 10.0, np.inf],
+            labels=False,
+        ).astype(int).astype(str)
+        df["stress_count_cat"] = df["stress_count"].astype(int).astype(str)
+        df["peak_stage_bucket"] = np.where(
+            peak_no_mulch,
+            "peak_no_mulch",
+            np.where(peak_stage, "peak", "other"),
+        )
+    if ARGS.categorical_crosses:
+        df["Crop_Type__Season"] = df["Crop_Type"].astype(str) + "__" + df["Season"].astype(str)
+        df["Irrigation_Type__Water_Source"] = (
+            df["Irrigation_Type"].astype(str) + "__" + df["Water_Source"].astype(str)
+        )
+        df["Soil_Type__Region"] = df["Soil_Type"].astype(str) + "__" + df["Region"].astype(str)
+        df["Crop_Growth_Stage__Mulching_Used"] = (
+            df["Crop_Growth_Stage"].astype(str) + "__" + df["Mulching_Used"].astype(str)
+        )
+        df["Crop_Growth_Stage__Mulching_Used__Water_Source"] = (
+            df["Crop_Growth_Stage"].astype(str)
+            + "__"
+            + df["Mulching_Used"].astype(str)
+            + "__"
+            + df["Water_Source"].astype(str)
+        )
+        df["Crop_Growth_Stage__Mulching_Used__Irrigation_Type"] = (
+            df["Crop_Growth_Stage"].astype(str)
+            + "__"
+            + df["Mulching_Used"].astype(str)
+            + "__"
+            + df["Irrigation_Type"].astype(str)
+        )
     return df
 
 
@@ -188,24 +340,254 @@ def search_refined_weights(prob_matrices, y_true):
 
     return best_ba, best_w, coarse_ba, coarse_w, len(candidate_weights)
 
+
+def predict_with_class_scales(prob_matrix, class_scales):
+    scaled = prob_matrix * np.asarray(class_scales, dtype=float)
+    return np.argmax(scaled, axis=1)
+
+
+def search_class_scales(prob_matrix, y_true):
+    best_scales = (1.0, 1.0, 1.0)
+    best_pred = np.argmax(prob_matrix, axis=1)
+    best_ba = balanced_accuracy_score(y_true, best_pred)
+
+    for medium_scale in np.arange(0.90, 1.101, 0.01):
+        for high_scale in np.arange(0.70, 1.501, 0.01):
+            class_scales = (1.0, float(round(medium_scale, 2)), float(round(high_scale, 2)))
+            pred = predict_with_class_scales(prob_matrix, class_scales)
+            ba = balanced_accuracy_score(y_true, pred)
+            if ba > best_ba:
+                best_ba = ba
+                best_scales = class_scales
+                best_pred = pred
+
+    return best_ba, best_scales, best_pred
+
+
+def resolve_prediction_cache_path(cache_path):
+    if not cache_path:
+        return ""
+    if os.path.isabs(cache_path):
+        return cache_path
+    return os.path.join(_project_root, cache_path)
+
+
+def load_prediction_cache(cache_path):
+    cache = np.load(cache_path)
+    return {key: cache[key] for key in cache.files}
+
+
+def save_prediction_cache(cache_path, **payload):
+    cache_dir = os.path.dirname(cache_path)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    np.savez_compressed(cache_path, **payload)
+
+
+def stack_probabilities(prob_matrices):
+    stacked_parts = []
+    class_axis = np.arange(prob_matrices[0].shape[1], dtype=float)
+
+    for matrix in prob_matrices:
+        stacked_parts.append(matrix)
+        stacked_parts.append((matrix @ class_axis).reshape(-1, 1))
+        stacked_parts.append((matrix[:, 2] - matrix[:, 0]).reshape(-1, 1))
+        stacked_parts.append(np.max(matrix, axis=1, keepdims=True))
+
+    return np.hstack(stacked_parts)
+
+
+def build_meta_raw_features(df):
+    peak_stage = df["Crop_Growth_Stage"].isin(["Vegetative", "Flowering"]).astype(np.int8)
+    no_mulch = df["Mulching_Used"].eq("No").astype(np.int8)
+    river_source = df["Water_Source"].eq("River").astype(np.int8)
+    canal_irrigation = df["Irrigation_Type"].eq("Canal").astype(np.int8)
+    moisture_deficit = 100 - df["Soil_Moisture"]
+    drought_pressure = (
+        moisture_deficit * (df["Temperature_C"] + df["Wind_Speed_kmh"])
+        / (df["Rainfall_mm"] + 10)
+    )
+    stress_count = (
+        (df["Soil_Moisture"] <= 26).astype(np.int8)
+        + (df["Temperature_C"] >= 30).astype(np.int8)
+        + (df["Wind_Speed_kmh"] >= 12).astype(np.int8)
+        + (df["Rainfall_mm"] <= 1000).astype(np.int8)
+        + (peak_stage & no_mulch).astype(np.int8)
+    )
+    meta_frame = pd.DataFrame(
+        {
+            "Soil_Moisture": df["Soil_Moisture"],
+            "Temperature_C": df["Temperature_C"],
+            "Wind_Speed_kmh": df["Wind_Speed_kmh"],
+            "Rainfall_mm": df["Rainfall_mm"],
+            "Previous_Irrigation_mm": df["Previous_Irrigation_mm"],
+            "Field_Area_hectare": df["Field_Area_hectare"],
+            "water_stress": df["water_stress"],
+            "effective_rain": df["effective_rain"],
+            "aridity": df["aridity"],
+            "moisture_deficit": moisture_deficit,
+            "drought_pressure": drought_pressure,
+            "stress_count": stress_count,
+            "is_peak_stage": peak_stage,
+            "is_no_mulch": no_mulch,
+            "is_river_source": river_source,
+            "is_canal_irrigation": canal_irrigation,
+            "is_peak_no_mulch": (peak_stage & no_mulch).astype(np.int8),
+        }
+    )
+    return meta_frame.values.astype(float)
+
+
+def run_logreg_stack(train_features, y_true, test_features, sample_weights):
+    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    candidate_cs = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+    candidate_weights = [None, "balanced"]
+
+    best_score = -1.0
+    best_pred = None
+    best_config = None
+
+    for class_weight in candidate_weights:
+        for c_value in candidate_cs:
+            oof_pred = np.zeros(len(y_true), dtype=int)
+            for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+                scaler = StandardScaler()
+                X_tr = scaler.fit_transform(train_features[tr_idx])
+                X_val = scaler.transform(train_features[val_idx])
+                model = LogisticRegression(
+                    C=c_value,
+                    class_weight=class_weight,
+                    max_iter=2000,
+                    n_jobs=-1,
+                    solver="lbfgs",
+                )
+                model.fit(
+                    X_tr,
+                    y_true[tr_idx],
+                    sample_weight=sample_weights[tr_idx],
+                )
+                oof_pred[val_idx] = model.predict(X_val)
+
+            score = balanced_accuracy_score(y_true, oof_pred)
+            if score > best_score:
+                best_score = score
+                best_pred = oof_pred
+                best_config = {"C": c_value, "class_weight": class_weight}
+
+    print(
+        "Best logreg stack config — "
+        f"C:{best_config['C']:.2f} "
+        f"class_weight:{best_config['class_weight'] or 'none'}"
+    )
+
+    full_model = LogisticRegression(
+        C=best_config["C"],
+        class_weight=best_config["class_weight"],
+        max_iter=2000,
+        n_jobs=-1,
+        solver="lbfgs",
+    )
+    scaler = StandardScaler()
+    train_scaled = scaler.fit_transform(train_features)
+    test_scaled = scaler.transform(test_features)
+    full_model.fit(train_scaled, y_true, sample_weight=sample_weights)
+    final_test_pred = full_model.predict(test_scaled)
+
+    return best_score, best_pred, final_test_pred
+
+
+def run_mlp_stack(train_features, y_true, test_features, sample_weights):
+    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    candidate_configs = [
+        {"hidden_layer_sizes": (64, 32), "alpha": 1e-4, "learning_rate_init": 1e-3},
+        {"hidden_layer_sizes": (128, 64), "alpha": 5e-4, "learning_rate_init": 1e-3},
+    ]
+
+    best_score = -1.0
+    best_pred = None
+    best_config = None
+
+    for config in candidate_configs:
+        oof_pred = np.zeros(len(y_true), dtype=int)
+        for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+            scaler = StandardScaler()
+            X_tr = scaler.fit_transform(train_features[tr_idx])
+            X_val = scaler.transform(train_features[val_idx])
+            model = MLPClassifier(
+                hidden_layer_sizes=config["hidden_layer_sizes"],
+                alpha=config["alpha"],
+                learning_rate_init=config["learning_rate_init"],
+                batch_size=4096,
+                early_stopping=True,
+                max_iter=80,
+                n_iter_no_change=10,
+                random_state=SEED,
+            )
+            model.fit(X_tr, y_true[tr_idx], sample_weight=sample_weights[tr_idx])
+            oof_pred[val_idx] = model.predict(X_val)
+
+        score = balanced_accuracy_score(y_true, oof_pred)
+        if score > best_score:
+            best_score = score
+            best_pred = oof_pred
+            best_config = config
+
+    print(
+        "Best mlp stack config — "
+        f"hidden:{best_config['hidden_layer_sizes']} "
+        f"alpha:{best_config['alpha']:.5f} "
+        f"lr:{best_config['learning_rate_init']:.5f}"
+    )
+
+    scaler = StandardScaler()
+    train_scaled = scaler.fit_transform(train_features)
+    test_scaled = scaler.transform(test_features)
+    full_model = MLPClassifier(
+        hidden_layer_sizes=best_config["hidden_layer_sizes"],
+        alpha=best_config["alpha"],
+        learning_rate_init=best_config["learning_rate_init"],
+        batch_size=4096,
+        early_stopping=True,
+        max_iter=80,
+        n_iter_no_change=10,
+        random_state=SEED,
+    )
+    full_model.fit(train_scaled, y_true, sample_weight=sample_weights)
+    final_test_pred = full_model.predict(test_scaled)
+
+    return best_score, best_pred, final_test_pred
+
 train = add_features(train)
 test  = add_features(test)
 
-FEAT_COLS = NUM_COLS + ENG_COLS + CAT_COLS  # used by CatBoost
+CAT_COLS = (
+    BASE_CAT_COLS
+    + (CROSS_CAT_COLS if ARGS.categorical_crosses else [])
+    + (STRESS_CAT_COLS if ARGS.stress_signals else [])
+)
+MODEL_NUM_COLS = (
+    NUM_COLS
+    + ENG_COLS
+    + (RISK_FLAG_COLS if ARGS.risk_flags else [])
+    + (STRESS_NUM_COLS if ARGS.stress_signals else [])
+)
+FEAT_COLS = MODEL_NUM_COLS + CAT_COLS  # used by CatBoost
 
 # Ordinal-encode categoricals for LGB / XGB
 oe = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
 train_cat_enc = oe.fit_transform(train[CAT_COLS])
 test_cat_enc  = oe.transform(test[CAT_COLS])
 
-X_num  = train[NUM_COLS + ENG_COLS].values
-X_test_num = test[NUM_COLS + ENG_COLS].values
+X_num  = train[MODEL_NUM_COLS].values
+X_test_num = test[MODEL_NUM_COLS].values
 
 X      = np.hstack([X_num, train_cat_enc])
 X_test = np.hstack([X_test_num, test_cat_enc])
 y      = train["label"].values
+meta_train_raw = build_meta_raw_features(train)
+meta_test_raw = build_meta_raw_features(test)
 
-lgb_cat_indices = list(range(len(NUM_COLS + ENG_COLS), X.shape[1]))
+lgb_cat_indices = list(range(len(MODEL_NUM_COLS), X.shape[1]))
 
 # ── 4. Class weights ──────────────────────────────────────────────────────────
 
@@ -229,136 +611,169 @@ pred_cat = np.zeros((len(X_test), n_classes))
 
 best_iters_lgb = []
 best_iters_xgb = []
+cache_path = resolve_prediction_cache_path(ARGS.prediction_cache)
 
-# ── 6. LightGBM ───────────────────────────────────────────────────────────────
+if cache_path and os.path.exists(cache_path):
+    print("\n" + "─"*50)
+    print("Loading Prediction Cache")
+    print("─"*50)
+    cache_payload = load_prediction_cache(cache_path)
+    oof_lgb = cache_payload["oof_lgb"]
+    oof_xgb = cache_payload["oof_xgb"]
+    oof_cat = cache_payload["oof_cat"]
+    pred_lgb = cache_payload["pred_lgb"]
+    pred_xgb = cache_payload["pred_xgb"]
+    pred_cat = cache_payload["pred_cat"]
+    best_iters_lgb = cache_payload["best_iters_lgb"].astype(int).tolist()
+    best_iters_xgb = cache_payload["best_iters_xgb"].astype(int).tolist()
+    print(f"Prediction cache loaded ← {cache_path}")
+    print(f"LGB OOF BA: {balanced_accuracy_score(y, np.argmax(oof_lgb, axis=1)):.4f}")
+    print(f"XGB OOF BA: {balanced_accuracy_score(y, np.argmax(oof_xgb, axis=1)):.4f}")
+    print(f"CAT OOF BA: {balanced_accuracy_score(y, np.argmax(oof_cat, axis=1)):.4f}")
+else:
+    # ── 6. LightGBM ───────────────────────────────────────────────────────────
 
-print("\n" + "─"*50)
-print("LightGBM")
-print("─"*50)
+    print("\n" + "─"*50)
+    print("LightGBM")
+    print("─"*50)
 
-lgb_params = dict(
-    objective        = "multiclass",
-    num_class        = 3,
-    metric           = "multi_logloss",
-    n_estimators     = 3000,
-    learning_rate    = 0.05,
-    num_leaves       = 127,
-    min_child_samples= 20,
-    subsample        = 0.8,
-    subsample_freq   = 1,
-    colsample_bytree = 0.8,
-    reg_alpha        = 0.1,
-    reg_lambda       = 1.0,
-    is_unbalance     = True,
-    random_state     = SEED,
-    n_jobs           = -1,
-    verbose          = -1,
-)
-
-for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
-    X_tr, X_val = X[tr_idx], X[val_idx]
-    y_tr, y_val = y[tr_idx], y[val_idx]
-
-    model = lgb.LGBMClassifier(**lgb_params)
-    model.fit(
-        X_tr, y_tr,
-        sample_weight    = sample_weights[tr_idx],
-        eval_set         = [(X_val, y_val)],
-        categorical_feature = lgb_cat_indices,
-        callbacks        = [lgb.early_stopping(100, verbose=False), lgb.log_evaluation(500)],
+    lgb_params = dict(
+        objective        = "multiclass",
+        num_class        = 3,
+        metric           = "multi_logloss",
+        n_estimators     = 3000,
+        learning_rate    = 0.05,
+        num_leaves       = 127,
+        min_child_samples= 20,
+        subsample        = 0.8,
+        subsample_freq   = 1,
+        colsample_bytree = 0.8,
+        reg_alpha        = 0.1,
+        reg_lambda       = 1.0,
+        is_unbalance     = True,
+        random_state     = SEED,
+        n_jobs           = -1,
+        verbose          = -1,
     )
-    oof_lgb[val_idx] = model.predict_proba(X_val)
-    pred_lgb += model.predict_proba(X_test) / N_FOLDS
-    best_iters_lgb.append(model.best_iteration_)
 
-    ba = balanced_accuracy_score(y_val, np.argmax(oof_lgb[val_idx], axis=1))
-    print(f"  Fold {fold+1}: BA = {ba:.4f}  (best iter: {model.best_iteration_})")
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
+        X_tr, X_val = X[tr_idx], X[val_idx]
+        y_tr, y_val = y[tr_idx], y[val_idx]
 
-print(f"LGB OOF BA: {balanced_accuracy_score(y, np.argmax(oof_lgb, axis=1)):.4f}")
+        model = lgb.LGBMClassifier(**lgb_params)
+        model.fit(
+            X_tr, y_tr,
+            sample_weight    = sample_weights[tr_idx],
+            eval_set         = [(X_val, y_val)],
+            categorical_feature = lgb_cat_indices,
+            callbacks        = [lgb.early_stopping(100, verbose=False), lgb.log_evaluation(500)],
+        )
+        oof_lgb[val_idx] = model.predict_proba(X_val)
+        pred_lgb += model.predict_proba(X_test) / N_FOLDS
+        best_iters_lgb.append(model.best_iteration_)
 
-# ── 7. XGBoost ────────────────────────────────────────────────────────────────
+        ba = balanced_accuracy_score(y_val, np.argmax(oof_lgb[val_idx], axis=1))
+        print(f"  Fold {fold+1}: BA = {ba:.4f}  (best iter: {model.best_iteration_})")
 
-print("\n" + "─"*50)
-print("XGBoost")
-print("─"*50)
+    print(f"LGB OOF BA: {balanced_accuracy_score(y, np.argmax(oof_lgb, axis=1)):.4f}")
 
-xgb_params = dict(
-    objective        = "multi:softprob",
-    num_class        = 3,
-    eval_metric      = "mlogloss",
-    n_estimators     = 3000,
-    learning_rate    = 0.05,
-    max_depth        = 7,
-    min_child_weight = 5,
-    subsample        = 0.8,
-    colsample_bytree = 0.8,
-    reg_alpha        = 0.1,
-    reg_lambda       = 1.0,
-    tree_method      = "hist",
-    random_state     = SEED,
-    n_jobs           = -1,
-    verbosity        = 0,
-    early_stopping_rounds = 100,
-)
+    # ── 7. XGBoost ────────────────────────────────────────────────────────────
 
-for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
-    X_tr, X_val = X[tr_idx], X[val_idx]
-    y_tr, y_val = y[tr_idx], y[val_idx]
+    print("\n" + "─"*50)
+    print("XGBoost")
+    print("─"*50)
 
-    model = xgb.XGBClassifier(**xgb_params)
-    model.fit(
-        X_tr, y_tr,
-        sample_weight = sample_weights[tr_idx],
-        eval_set      = [(X_val, y_val)],
-        verbose       = 500,
-    )
-    oof_xgb[val_idx] = model.predict_proba(X_val)
-    pred_xgb += model.predict_proba(X_test) / N_FOLDS
-    best_iters_xgb.append(model.best_iteration)
-
-    ba = balanced_accuracy_score(y_val, np.argmax(oof_xgb[val_idx], axis=1))
-    print(f"  Fold {fold+1}: BA = {ba:.4f}  (best iter: {model.best_iteration})")
-
-print(f"XGB OOF BA: {balanced_accuracy_score(y, np.argmax(oof_xgb, axis=1)):.4f}")
-
-# ── 8. CatBoost ───────────────────────────────────────────────────────────────
-
-print("\n" + "─"*50)
-print("CatBoost")
-print("─"*50)
-
-X_cb      = train[FEAT_COLS].values
-X_test_cb = test[FEAT_COLS].values
-cat_col_indices = [FEAT_COLS.index(c) for c in CAT_COLS]
-
-for fold, (tr_idx, val_idx) in enumerate(skf.split(X_cb, y)):
-    X_tr, X_val = X_cb[tr_idx], X_cb[val_idx]
-    y_tr, y_val = y[tr_idx], y[val_idx]
-
-    model = CatBoostClassifier(
-        iterations         = 3000,
-        learning_rate      = 0.05,
-        depth              = 7,
-        l2_leaf_reg        = 3,
-        loss_function      = "MultiClass",
-        eval_metric        = "MultiClass",
-        cat_features       = cat_col_indices,
-        random_seed        = SEED,
+    xgb_params = dict(
+        objective        = "multi:softprob",
+        num_class        = 3,
+        eval_metric      = "mlogloss",
+        n_estimators     = 3000,
+        learning_rate    = 0.05,
+        max_depth        = 7,
+        min_child_weight = 5,
+        subsample        = 0.8,
+        colsample_bytree = 0.8,
+        reg_alpha        = 0.1,
+        reg_lambda       = 1.0,
+        tree_method      = "hist",
+        random_state     = SEED,
+        n_jobs           = -1,
+        verbosity        = 0,
         early_stopping_rounds = 100,
-        verbose            = 500,
     )
-    model.fit(
-        X_tr, y_tr,
-        sample_weight = sample_weights[tr_idx],
-        eval_set      = (X_val, y_val),
-    )
-    oof_cat[val_idx] = model.predict_proba(X_val)
-    pred_cat += model.predict_proba(X_test_cb) / N_FOLDS
 
-    ba = balanced_accuracy_score(y_val, np.argmax(oof_cat[val_idx], axis=1))
-    print(f"  Fold {fold+1}: BA = {ba:.4f}")
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
+        X_tr, X_val = X[tr_idx], X[val_idx]
+        y_tr, y_val = y[tr_idx], y[val_idx]
 
-print(f"CAT OOF BA: {balanced_accuracy_score(y, np.argmax(oof_cat, axis=1)):.4f}")
+        model = xgb.XGBClassifier(**xgb_params)
+        model.fit(
+            X_tr, y_tr,
+            sample_weight = sample_weights[tr_idx],
+            eval_set      = [(X_val, y_val)],
+            verbose       = 500,
+        )
+        oof_xgb[val_idx] = model.predict_proba(X_val)
+        pred_xgb += model.predict_proba(X_test) / N_FOLDS
+        best_iters_xgb.append(model.best_iteration)
+
+        ba = balanced_accuracy_score(y_val, np.argmax(oof_xgb[val_idx], axis=1))
+        print(f"  Fold {fold+1}: BA = {ba:.4f}  (best iter: {model.best_iteration})")
+
+    print(f"XGB OOF BA: {balanced_accuracy_score(y, np.argmax(oof_xgb, axis=1)):.4f}")
+
+    # ── 8. CatBoost ───────────────────────────────────────────────────────────
+
+    print("\n" + "─"*50)
+    print("CatBoost")
+    print("─"*50)
+
+    X_cb      = train[FEAT_COLS].values
+    X_test_cb = test[FEAT_COLS].values
+    cat_col_indices = [FEAT_COLS.index(c) for c in CAT_COLS]
+
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_cb, y)):
+        X_tr, X_val = X_cb[tr_idx], X_cb[val_idx]
+        y_tr, y_val = y[tr_idx], y[val_idx]
+
+        model = CatBoostClassifier(
+            iterations         = 3000,
+            learning_rate      = 0.05,
+            depth              = 7,
+            l2_leaf_reg        = 3,
+            loss_function      = "MultiClass",
+            eval_metric        = "MultiClass",
+            cat_features       = cat_col_indices,
+            random_seed        = SEED,
+            early_stopping_rounds = 100,
+            verbose            = 500,
+        )
+        model.fit(
+            X_tr, y_tr,
+            sample_weight = sample_weights[tr_idx],
+            eval_set      = (X_val, y_val),
+        )
+        oof_cat[val_idx] = model.predict_proba(X_val)
+        pred_cat += model.predict_proba(X_test_cb) / N_FOLDS
+
+        ba = balanced_accuracy_score(y_val, np.argmax(oof_cat[val_idx], axis=1))
+        print(f"  Fold {fold+1}: BA = {ba:.4f}")
+
+    print(f"CAT OOF BA: {balanced_accuracy_score(y, np.argmax(oof_cat, axis=1)):.4f}")
+
+    if cache_path:
+        save_prediction_cache(
+            cache_path,
+            oof_lgb=oof_lgb,
+            oof_xgb=oof_xgb,
+            oof_cat=oof_cat,
+            pred_lgb=pred_lgb,
+            pred_xgb=pred_xgb,
+            pred_cat=pred_cat,
+            best_iters_lgb=np.asarray(best_iters_lgb, dtype=int),
+            best_iters_xgb=np.asarray(best_iters_xgb, dtype=int),
+        )
+        print(f"Prediction cache saved → {cache_path}")
 
 # ── 9. Ensemble weight search ─────────────────────────────────────────────────
 
@@ -385,8 +800,49 @@ else:
 
 best_blend = blend_probabilities(prob_matrices_oof, best_w)
 ensemble_oof_pred = np.argmax(best_blend, axis=1)
+class_scales = (1.0, 1.0, 1.0)
+test_pred_idx = predict_with_class_scales(
+    blend_probabilities(prob_matrices_test, best_w),
+    class_scales,
+)
 
 print(f"Best weights — LGB:{best_w[0]:.2f}  XGB:{best_w[1]:.2f}  CAT:{best_w[2]:.2f}")
+if ARGS.decision_policy == "class_scale_search":
+    best_ba, class_scales, ensemble_oof_pred = search_class_scales(best_blend, y)
+    print(
+        f"Best class scales — Low:{class_scales[0]:.2f}  "
+        f"Medium:{class_scales[1]:.2f}  High:{class_scales[2]:.2f}"
+    )
+    test_pred_idx = predict_with_class_scales(
+        blend_probabilities(prob_matrices_test, best_w),
+        class_scales,
+    )
+elif ARGS.decision_policy == "logreg_stack":
+    stack_train = stack_probabilities(prob_matrices_oof)
+    stack_test = stack_probabilities(prob_matrices_test)
+    if ARGS.meta_raw_features:
+        stack_train = np.hstack([stack_train, meta_train_raw])
+        stack_test = np.hstack([stack_test, meta_test_raw])
+    best_ba, ensemble_oof_pred, test_pred_idx = run_logreg_stack(
+        stack_train,
+        y,
+        stack_test,
+        sample_weights,
+    )
+    print("Meta-model: multinomial logistic regression on cached OOF probabilities")
+elif ARGS.decision_policy == "mlp_stack":
+    stack_train = stack_probabilities(prob_matrices_oof)
+    stack_test = stack_probabilities(prob_matrices_test)
+    if ARGS.meta_raw_features:
+        stack_train = np.hstack([stack_train, meta_train_raw])
+        stack_test = np.hstack([stack_test, meta_test_raw])
+    best_ba, ensemble_oof_pred, test_pred_idx = run_mlp_stack(
+        stack_train,
+        y,
+        stack_test,
+        sample_weights,
+    )
+    print("Meta-model: ANN stacker on cached OOF probabilities")
 print(f"Ensemble OOF BA: {best_ba:.4f}")
 print_class_diagnostics(y, ensemble_oof_pred, LABEL_ORDER)
 
@@ -397,12 +853,14 @@ print(f"best_iteration: {avg_best_iter}")
 
 # ── 10. Generate submission ───────────────────────────────────────────────────
 
-test_blend = blend_probabilities(prob_matrices_test, best_w)
-test_pred  = label_enc.inverse_transform(np.argmax(test_blend, axis=1))
+test_pred  = label_enc.inverse_transform(test_pred_idx)
 
-sub["Irrigation_Need"] = test_pred
-pred_path = os.path.join(PRED_DIR, "prediction_irr_need.csv")
-sub.to_csv(pred_path, index=False)
-
-print(f"\nPrediction saved → {pred_path}")
-print(f"Prediction distribution:\n{pd.Series(test_pred).value_counts()}")
+if ARGS.skip_predictions:
+    print("\nPrediction save skipped for challenger safety.")
+    print(f"Prediction distribution (unsaved):\n{pd.Series(test_pred).value_counts()}")
+else:
+    sub["Irrigation_Need"] = test_pred
+    pred_path = os.path.join(PRED_DIR, "prediction_irr_need.csv")
+    sub.to_csv(pred_path, index=False)
+    print(f"\nPrediction saved → {pred_path}")
+    print(f"Prediction distribution:\n{pd.Series(test_pred).value_counts()}")
