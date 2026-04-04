@@ -32,7 +32,7 @@ def exact_match_metric(prediction: Any, example: Example) -> float:
 
 
 def numeric_metric(prediction: Any, example: Example) -> float:
-    pred_value = _extract_number(prediction)
+    pred_value = _extract_reference_number(prediction)
     target_value = _extract_reference_number(example.target)
     if pred_value is None or target_value is None:
         return exact_match_metric(prediction, example)

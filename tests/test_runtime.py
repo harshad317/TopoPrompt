@@ -92,3 +92,5 @@ def test_gsm8k_metric_uses_final_answer_marker():
     )
     assert numeric_metric("72", example) == 1.0
     assert numeric_metric("48", example) == 0.0
+    assert numeric_metric("We compute 8 * 9 = 72, so the final answer is 72.", example) == 1.0
+    assert numeric_metric("First we saw 8 and 9, but the final answer is 48.", example) == 0.0
