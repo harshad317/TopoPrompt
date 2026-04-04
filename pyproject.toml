@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dspy = ["dspy>=2.6.0"]
+dspy = ["dspy>=3.0.4"]
 dev = [
   "pytest>=8.4.2",
 ]

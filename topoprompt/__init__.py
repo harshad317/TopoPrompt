@@ -1,5 +1,11 @@
 from topoprompt.config import TopoPromptConfig, load_config
 from topoprompt.eval.compare import compare_programs
+from topoprompt.eval.dspy_baselines import (
+    compare_topoprompt_vs_dspy,
+    compile_dspy_baseline,
+    evaluate_dspy_program_on_examples,
+    load_dspy_program,
+)
 from topoprompt.eval.significance import summarize_significance_from_compare_dir
 from topoprompt.schemas import CompileArtifact, Example, PromptProgram, TaskSpec
 
@@ -15,8 +21,12 @@ __all__ = [
     "PromptProgram",
     "TaskSpec",
     "TopoPromptConfig",
+    "compare_topoprompt_vs_dspy",
     "compare_programs",
     "compile_task",
+    "compile_dspy_baseline",
+    "evaluate_dspy_program_on_examples",
     "load_config",
+    "load_dspy_program",
     "summarize_significance_from_compare_dir",
 ]
