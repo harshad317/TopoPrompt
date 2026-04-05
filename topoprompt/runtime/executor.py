@@ -126,6 +126,18 @@ class ProgramExecutor:
                         confidence = 0.0
                 else:
                     branch, confidence = resolve_route_choice(route_spec, trace.parsed_output or {})
+                # If the route spec defines a confidence threshold and the model
+                # returned a confidence below it, fall back to the designated
+                # safe branch rather than committing to an uncertain choice.
+                # This reduces routing failures on heterogeneous tasks where the
+                # LLM is unsure which branch to take.
+                if (
+                    route_spec.confidence_threshold is not None
+                    and confidence < route_spec.confidence_threshold
+                    and route_spec.fallback_branch is not None
+                    and route_spec.fallback_branch in route_spec.branch_labels
+                ):
+                    branch = route_spec.fallback_branch
                 trace.route_choice = branch
                 trace.confidence = confidence
                 if self.reporter is not None:

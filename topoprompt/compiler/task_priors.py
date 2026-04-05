@@ -308,13 +308,11 @@ def heuristic_task_analysis(
     else:
         input_heterogeneity = "low"
 
-    candidate_routes = (
-        [
-            RouteCandidate(label="direct", description="Use for straightforward items that can be answered directly."),
-            RouteCandidate(label="solve", description="Use for items that need analysis, reasoning, or careful checking."),
-        ]
-        if input_heterogeneity != "low" and task_family in {"classification", "factual_qa", "math_reasoning", "mixed", "reasoning"}
-        else []
+    candidate_routes = _recommend_candidate_routes(
+        task_family=task_family,
+        input_heterogeneity=input_heterogeneity,
+        needs_reasoning=needs_reasoning,
+        needs_decomposition=needs_decomposition,
     )
 
     initial_seed_templates = _recommend_seed_templates(
@@ -343,6 +341,146 @@ def heuristic_task_analysis(
         analyzer_confidence=0.46,
         rationale=rationale,
     )
+
+
+def _recommend_candidate_routes(
+    *,
+    task_family: str,
+    input_heterogeneity: str,
+    needs_reasoning: bool,
+    needs_decomposition: bool,
+) -> list[RouteCandidate]:
+    """Return task-family-specific route candidates.
+
+    Generic "direct vs solve" labels are replaced with semantically meaningful
+    branch descriptions so the route LLM makes more accurate decisions at
+    inference time.  Routing is only recommended when input heterogeneity
+    warrants it.
+    """
+    if input_heterogeneity == "low":
+        return []
+
+    if task_family == "math_reasoning":
+        routes = [
+            RouteCandidate(
+                label="direct",
+                description=(
+                    "Use for simple arithmetic or single-step calculations where "
+                    "the answer can be read off immediately (e.g. 'What is 12 × 4?')."
+                ),
+            ),
+            RouteCandidate(
+                label="solve",
+                description=(
+                    "Use for multi-step word problems that require setting up "
+                    "equations, tracking intermediate quantities, or reasoning "
+                    "across multiple sentences."
+                ),
+            ),
+        ]
+        if needs_decomposition:
+            routes.append(RouteCandidate(
+                label="decompose",
+                description=(
+                    "Use for complex problems with multiple sub-questions or "
+                    "where breaking into parts before solving reduces errors."
+                ),
+            ))
+        return routes
+
+    if task_family == "reasoning":
+        return [
+            RouteCandidate(
+                label="lookup",
+                description=(
+                    "Use when the question can be answered by recalling a direct "
+                    "fact or single inference step (e.g. 'Is X a Y?')."
+                ),
+            ),
+            RouteCandidate(
+                label="solve",
+                description=(
+                    "Use for multi-hop reasoning where several facts must be "
+                    "chained together before arriving at the answer."
+                ),
+            ),
+        ]
+
+    if task_family == "classification":
+        return [
+            RouteCandidate(
+                label="direct",
+                description=(
+                    "Use for clear-cut examples where the correct label is "
+                    "unambiguous from surface-level signals."
+                ),
+            ),
+            RouteCandidate(
+                label="solve",
+                description=(
+                    "Use for ambiguous or nuanced examples that require careful "
+                    "reading, comparison of candidates, or contextual reasoning."
+                ),
+            ),
+        ]
+
+    if task_family == "factual_qa":
+        return [
+            RouteCandidate(
+                label="direct",
+                description="Use for factual questions with a single well-known answer.",
+            ),
+            RouteCandidate(
+                label="solve",
+                description=(
+                    "Use for questions requiring comparison, calculation, or "
+                    "retrieval from a provided passage."
+                ),
+            ),
+        ]
+
+    if task_family in {"extraction", "instruction_following"}:
+        return [
+            RouteCandidate(
+                label="direct",
+                description="Use for structured inputs with well-defined fields to extract.",
+            ),
+            RouteCandidate(
+                label="solve",
+                description=(
+                    "Use for unstructured or noisy inputs where fields must be "
+                    "inferred or the instructions have multiple constraints."
+                ),
+            ),
+        ]
+
+    if task_family == "mixed":
+        return [
+            RouteCandidate(
+                label="direct",
+                description="Use for items that can be answered with a straightforward response.",
+            ),
+            RouteCandidate(
+                label="solve",
+                description="Use for items that require analysis, reasoning, or multi-step work.",
+            ),
+        ]
+
+    # Fallback for remaining families (generation, summarization, code, other)
+    # only recommend routing when heterogeneity is clearly high.
+    if input_heterogeneity == "high":
+        return [
+            RouteCandidate(
+                label="direct",
+                description="Use for straightforward items that can be answered directly.",
+            ),
+            RouteCandidate(
+                label="solve",
+                description="Use for items that need analysis, reasoning, or careful checking.",
+            ),
+        ]
+
+    return []
 
 
 def heuristic_task_analysis_from_prompt(*, user_prompt: str) -> TaskAnalysis:

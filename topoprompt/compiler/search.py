@@ -36,7 +36,9 @@ from topoprompt.schemas import (
     TaskAnalysis,
     TaskSpec,
 )
+from topoprompt.transfer.acquisition import DiversityAcquisition
 from topoprompt.transfer.features import extract_compile_winner_record, extract_transfer_features
+from topoprompt.transfer.posterior import HistoricalPosterior
 from topoprompt.transfer.store import TraceStore
 
 
@@ -224,6 +226,15 @@ def compile_task(
 
     archive_records = [_archive_record(candidate, round_index=0) for candidate in seed_evals]
     compile_traces = [trace for candidate in seed_evals for trace in candidate.traces]
+
+    # Apply historical posterior re-ranking before beam selection.
+    # Candidates whose topology family historically performed well on similar
+    # tasks are ranked higher, guiding the beam toward proven structures while
+    # still allowing the raw evaluation scores to dominate (prior weight ≤ 0.35).
+    historical_records = trace_store.records
+    posterior = HistoricalPosterior(historical_records)
+    seed_evals = posterior.rank(seed_evals)
+
     beam = _select_diverse_beam(seed_evals, width=config.compile.beam_width, min_families=config.compile.min_structural_families)
     beam_family_count_by_round = [len({candidate.family_signature for candidate in beam})] if beam else [0]
     best_beam_score = max((candidate.score for candidate in beam), default=0.0)
@@ -255,6 +266,7 @@ def compile_task(
                 analysis=analysis,
                 config=config,
                 incumbent_score=parent.score,
+                incumbent_score_variance=_score_variance(parent),
             ))
             if config.compile.llm_edit_proposals_enabled:
                 edits.extend(
@@ -864,6 +876,20 @@ def _default_rewrite_target(program: PromptProgram) -> str | None:
         if node.execution_mode != "pass_through":
             return node.node_id
     return None
+
+
+def _score_variance(candidate: CandidateEvaluation) -> float:
+    """Return the sample variance of per-example scores for a candidate.
+
+    Used to detect inconsistency: a high-scoring but high-variance program may
+    still benefit from structural edits (routing, verification) that reduce
+    error spread.  Returns 0.0 when fewer than 2 examples are available.
+    """
+    scores = candidate.example_scores
+    if not scores or len(scores) < 2:
+        return 0.0
+    from statistics import variance as _variance
+    return _variance(scores)
 
 
 def _program_summary(program: PromptProgram, candidate: CandidateEvaluation | None = None) -> dict[str, Any]:

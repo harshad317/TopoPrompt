@@ -293,6 +293,7 @@ def instantiate_seed_program(*, task_spec: TaskSpec, analysis: TaskAnalysis, tem
                         "solve": default_branch_descriptions.get("solve", "Reasoning branch"),
                     },
                     fallback_branch="direct",
+                    confidence_threshold=0.55,
                 ),
                 prompt_modules=default_prompt_modules(NodeType.ROUTE, task_analysis=analysis),
             )
@@ -344,6 +345,7 @@ def instantiate_seed_program(*, task_spec: TaskSpec, analysis: TaskAnalysis, tem
                         "plan_solve": "Use for reasoning tasks that benefit from a plan.",
                     },
                     fallback_branch="direct",
+                    confidence_threshold=0.55,
                 ),
                 prompt_modules=default_prompt_modules(NodeType.ROUTE, task_analysis=analysis),
             )

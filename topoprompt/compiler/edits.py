@@ -20,10 +20,45 @@ _DESTRUCTIVE_STRUCTURAL_EDIT_TYPES: frozenset[str] = frozenset({
     "drop_fewshot_module",
 })
 
-# Programs scoring at or above this threshold are considered high-performing.
-# Destructive structural edits are suppressed to avoid mutating them away from
-# their optimum — only conservative edits (fewshot, rewrite, verify) are allowed.
-_HIGH_SCORE_CONSERVATIVE_THRESHOLD = 0.85
+# Per-task-family conservative thresholds.
+#
+# The threshold represents the score above which destructive structural edits
+# are suppressed.  Tasks with low ceilings (BBH ~0.65, reasoning ~0.75) need
+# aggressive structural exploration even at moderate scores, while tasks with
+# high ceilings (classification, SST2 ~0.97) should lock down structure early.
+#
+# Rationale per family:
+#   classification / factual_qa — short inputs, high ceiling, prompt tuning
+#     dominates; structure adds little above 0.88.
+#   math_reasoning / reasoning / code — multi-step, structured reasoning
+#     programs (plan→solve→verify) can yield large gains; allow exploration
+#     until 0.80 to give the search room to discover them.
+#   extraction / instruction_following — format precision matters; verify/route
+#     still valuable; moderate threshold.
+#   generation / summarization — open-ended, quality hard to measure with
+#     binary metrics; conservative exploration appropriate.
+#   mixed / other — unknown ceiling; use a moderately permissive threshold.
+_FAMILY_CONSERVATIVE_THRESHOLDS: dict[str, float] = {
+    "classification":         0.92,
+    "factual_qa":             0.90,
+    "extraction":             0.88,
+    "instruction_following":  0.88,
+    "generation":             0.88,
+    "summarization":          0.88,
+    "math_reasoning":         0.80,
+    "reasoning":              0.80,
+    "code":                   0.80,
+    "mixed":                  0.85,
+    "other":                  0.85,
+}
+_DEFAULT_CONSERVATIVE_THRESHOLD = 0.85
+
+
+def _conservative_threshold(task_family: str | None) -> float:
+    """Return the structural-edit suppression threshold for a given task family."""
+    if task_family is None:
+        return _DEFAULT_CONSERVATIVE_THRESHOLD
+    return _FAMILY_CONSERVATIVE_THRESHOLDS.get(task_family.lower(), _DEFAULT_CONSERVATIVE_THRESHOLD)
 
 
 def generate_heuristic_edits(
@@ -32,6 +67,7 @@ def generate_heuristic_edits(
     analysis: TaskAnalysis,
     config: TopoPromptConfig,
     incumbent_score: float = 0.0,
+    incumbent_score_variance: float = 0.0,
 ) -> list[CandidateEdit]:
     _reset_edit_dedupe()
     family = analysis.task_family or "other"
@@ -151,11 +187,25 @@ def generate_heuristic_edits(
         _add_route_tuning_edits(edits, program)
         _add_fewshot_edits(edits, program)
 
-    # When the parent program is already high-scoring, suppress destructive
-    # structural edits that are likely to mutate it away from its optimum.
-    # Conservative edits (fewshot tuning, prompt rewrites, verify insertion)
-    # are still allowed — they tend to refine rather than restructure.
-    if incumbent_score >= _HIGH_SCORE_CONSERVATIVE_THRESHOLD:
+    # Suppress destructive structural edits when the parent program is already
+    # high-scoring relative to its task family's expected ceiling.
+    #
+    # Two conditions independently trigger conservative mode:
+    #   1. Score ≥ family threshold (program is near ceiling for this task type)
+    #   2. Score ≥ default threshold AND variance is low (confident near-ceiling)
+    #
+    # High variance (>0.15) overrides the threshold: the model is inconsistent,
+    # meaning structural changes (routing, verification) might still reduce error
+    # spread — so exploration is allowed even at high mean scores.
+    task_family = analysis.task_family if analysis else None
+    threshold = _conservative_threshold(task_family)
+    high_variance = incumbent_score_variance > 0.15
+    near_ceiling = incumbent_score >= threshold
+    also_near_ceiling = (
+        incumbent_score >= _DEFAULT_CONSERVATIVE_THRESHOLD
+        and incumbent_score_variance < 0.05
+    )
+    if (near_ceiling or also_near_ceiling) and not high_variance:
         edits = [e for e in edits if e.edit_type not in _DESTRUCTIVE_STRUCTURAL_EDIT_TYPES]
 
     return edits[: config.compile.max_candidates_per_parent]
@@ -359,6 +409,7 @@ def _split_with_route(program: PromptProgram, target_node_id: str, analysis: Tas
                 "solve": "Reasoning branch.",
             },
             fallback_branch="direct",
+            confidence_threshold=0.55,
         ),
         task_analysis=analysis,
     )
