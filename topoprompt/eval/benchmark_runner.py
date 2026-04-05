@@ -632,12 +632,14 @@ def _normalize_optimizer_names(optimizers: str | list[str] | tuple[str, ...]) ->
         if not value:
             continue
         normalized = "mipro" if value.lower() == "miprov2" else value.lower()
+        if normalized == "topoprompt":
+            continue
         if normalized not in {"mipro", "gepa"}:
             raise ValueError(f"Unsupported DSPy optimizer: {value}")
         if normalized not in normalized_values:
             normalized_values.append(normalized)
     if not normalized_values:
-        raise ValueError("At least one DSPy optimizer is required.")
+        raise ValueError("At least one DSPy optimizer besides topoprompt is required.")
     return normalized_values
 
 

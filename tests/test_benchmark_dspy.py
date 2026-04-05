@@ -21,6 +21,8 @@ def test_benchmark_runner_compile_and_compare_with_dspy_smoke(monkeypatch, fake_
     examples_path = tmp_path / "sst2_examples.jsonl"
     examples_path.write_bytes(b"\n".join(orjson.dumps(row) for row in rows) + b"\n")
 
+    compiled_optimizers: list[str] = []
+
     def fake_compile_task(**kwargs):
         assert kwargs["metric"] == "sst2"
         program = PromptProgram(
@@ -65,6 +67,7 @@ def test_benchmark_runner_compile_and_compare_with_dspy_smoke(monkeypatch, fake_
 
     def fake_compile_dspy_baseline(**kwargs):
         optimizer_name = kwargs["optimizer_name"]
+        compiled_optimizers.append(optimizer_name)
         program_id = f"dspy_{optimizer_name}_predict"
         return {
             "program": SimpleNamespace(_topoprompt_program_id=program_id),
@@ -123,12 +126,13 @@ def test_benchmark_runner_compile_and_compare_with_dspy_smoke(monkeypatch, fake_
         benchmark_name="sst2",
         examples_path=examples_path,
         output_dir=tmp_path / "sst2_dspy_run",
-        optimizers=["mipro", "gepa"],
+        optimizers="topoprompt,mipro,gepa",
     )
 
     assert summary["benchmark_name"] == "sst2"
     assert summary["task_family"] == "classification"
     assert summary["topoprompt"]["program_id"] == "compiled_prog"
+    assert compiled_optimizers == ["mipro", "gepa"]
     assert set(summary["comparisons"]) == {"mipro", "gepa"}
     assert set(summary["pairwise_comparisons"]) == {
         "topoprompt_vs_mipro",

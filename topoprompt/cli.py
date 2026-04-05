@@ -134,7 +134,12 @@ def main() -> None:
     benchmark_dspy_parser.add_argument("--task-file", default=None)
     benchmark_dspy_parser.add_argument("--config", default=None)
     benchmark_dspy_parser.add_argument("--output-dir", required=True)
-    benchmark_dspy_parser.add_argument("--optimizers", default="mipro,gepa")
+    benchmark_dspy_parser.add_argument(
+        "--optimizers",
+        default="mipro,gepa",
+        help="Comma-separated DSPy optimizers to compare against TopoPrompt. "
+        "TopoPrompt is always included, and `topoprompt` is accepted as an optional explicit token.",
+    )
     benchmark_dspy_parser.add_argument("--compile-budget", type=int, default=None)
     benchmark_dspy_parser.add_argument("--compare-repeats", type=int, default=1)
     benchmark_dspy_parser.add_argument("--student-strategy", choices=["auto", "predict", "chain_of_thought"], default="auto")
