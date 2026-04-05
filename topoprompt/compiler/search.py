@@ -18,7 +18,7 @@ from topoprompt.compiler.validator import ProgramValidationError, validate_progr
 from topoprompt.config import TopoPromptConfig, load_config
 from topoprompt.eval.budget import BudgetLedger
 from topoprompt.eval.datasets import DatasetPartitions, partition_examples
-from topoprompt.eval.metrics import MetricFn, metric_for_name
+from topoprompt.eval.metrics import MetricFn, canonical_metric_name, metric_for_name
 from topoprompt.ir import family_signature, topology_fingerprint
 from topoprompt.progress import CompileProgressReporter
 from topoprompt.runtime.executor import BudgetExhausted, ProgramExecutor
@@ -416,7 +416,7 @@ def evaluate_program_on_examples(
 def _resolve_metric(metric: str | MetricFn | None) -> tuple[str, MetricFn]:
     if callable(metric):
         return getattr(metric, "__name__", "custom_metric"), metric
-    metric_name = metric or "exact_match"
+    metric_name = canonical_metric_name(metric)
     return metric_name, metric_for_name(metric_name)
 
 
@@ -441,8 +441,21 @@ def _resolve_partitions(
 
 
 def _infer_task_spec(*, task_description: str, examples: list[Example], task_id: str | None) -> TaskSpec:
+    python_to_jsonschema = {
+        "dict": "object",
+        "list": "array",
+        "str": "string",
+        "int": "number",
+        "float": "number",
+        "bool": "boolean",
+    }
     input_schema = {key: type(value).__name__ for key, value in (examples[0].input.items() if examples else [])}
-    output_schema = {"type": type(examples[0].target).__name__} if examples and examples[0].target is not None else {"type": "string"}
+    output_type = (
+        python_to_jsonschema.get(type(examples[0].target).__name__, "string")
+        if examples and examples[0].target is not None
+        else "string"
+    )
+    output_schema = {"type": output_type}
     return TaskSpec(
         task_id=task_id or "compiled_task",
         description=task_description,

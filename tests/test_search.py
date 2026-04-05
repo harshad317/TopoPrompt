@@ -7,6 +7,8 @@ from topoprompt.compiler.search import (
     _select_affordable_confirmation_candidates,
     _select_final_candidate,
     _select_final_selection_pool,
+    _infer_task_spec,
+    _resolve_metric,
     compile_task,
     evaluate_program_on_examples,
 )
@@ -50,6 +52,29 @@ def test_compile_budget_override_rebalances_phase_budgets(fake_backend, gsm8k_ex
 
     assert artifact.metrics.planned_budget_calls == 48
     assert sum(phase.planned_calls for phase in artifact.metrics.planned_budget_by_phase) == 48
+
+
+def test_resolve_metric_canonicalizes_benchmark_alias():
+    metric_name, metric_fn = _resolve_metric("gsm8k")
+
+    assert metric_name == "numeric"
+    assert metric_fn is numeric_metric
+
+
+def test_infer_task_spec_normalizes_python_targets_to_jsonschema_types():
+    task_spec = _infer_task_spec(
+        task_description="Extract entities and return structured data.",
+        examples=[
+            Example(
+                example_id="structured_1",
+                input={"prompt": "Ada founded Example Labs."},
+                target={"people": ["Ada"], "organizations": ["Example Labs"]},
+            )
+        ],
+        task_id="structured_task",
+    )
+
+    assert task_spec.output_schema == {"type": "object"}
 
 
 def test_evaluate_program_runs_full_dataset_without_compile_budget_cap(fake_backend, small_config, simple_task_spec):

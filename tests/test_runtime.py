@@ -84,6 +84,57 @@ def test_runtime_executes_direct_self_consistency_majority_vote(small_config, si
     assert result.state["candidate_answer_3"] == "12"
 
 
+def test_runtime_executes_format_finalize_program(fake_backend, small_config, simple_task_spec, gsm8k_examples):
+    analysis = TaskAnalysis(
+        output_format="json",
+        initial_seed_templates=["format_finalize"],
+    )
+    program = instantiate_seed_program(task_spec=simple_task_spec, analysis=analysis, template_name="format_finalize")
+    assert program is not None
+
+    executor = ProgramExecutor(backend=fake_backend, config=small_config)
+    result = executor.run_program(
+        program=program,
+        task_spec=simple_task_spec,
+        example_id=gsm8k_examples[0].example_id,
+        task_input=gsm8k_examples[0].input,
+        phase="confirmation",
+    )
+
+    assert result.trace.final_output == "4"
+    assert [trace.node_id for trace in result.trace.node_traces] == ["direct_1", "format_1", "finalize_1"]
+
+
+def test_runtime_executes_critique_revise_program(fake_backend, small_config, simple_task_spec, gsm8k_examples):
+    analysis = TaskAnalysis(
+        task_family="generation",
+        initial_seed_templates=["critique_revise_finalize"],
+    )
+    program = instantiate_seed_program(
+        task_spec=simple_task_spec,
+        analysis=analysis,
+        template_name="critique_revise_finalize",
+    )
+    assert program is not None
+
+    executor = ProgramExecutor(backend=fake_backend, config=small_config)
+    result = executor.run_program(
+        program=program,
+        task_spec=simple_task_spec,
+        example_id=gsm8k_examples[0].example_id,
+        task_input=gsm8k_examples[0].input,
+        phase="confirmation",
+    )
+
+    assert result.trace.final_output == "4"
+    assert [trace.node_id for trace in result.trace.node_traces] == [
+        "direct_1",
+        "critique_1",
+        "revise_1",
+        "finalize_1",
+    ]
+
+
 def test_gsm8k_metric_uses_final_answer_marker():
     example = Example(
         example_id="gsm8k_metric",

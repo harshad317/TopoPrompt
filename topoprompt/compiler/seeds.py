@@ -6,6 +6,8 @@ from topoprompt.schemas import NodeType, ProgramEdge, PromptModule, PromptProgra
 
 SEED_LIBRARY = [
     "direct_finalize",
+    "format_finalize",
+    "critique_revise_finalize",
     "plan_solve_finalize",
     "decompose_solve_finalize",
     "solve_verify_finalize",
@@ -125,6 +127,89 @@ def instantiate_seed_program(*, task_spec: TaskSpec, analysis: TaskAnalysis, tem
                 task_id=task_spec.task_id,
                 nodes=[direct, finalize],
                 edges=[ProgramEdge(source="direct_1", target="finalize_1")],
+                entry_node_id="direct_1",
+                finalize_node_id="finalize_1",
+                metadata={"seed_template": template_name},
+            )
+        case "format_finalize":
+            direct = create_node(
+                node_id="direct_1",
+                node_type=NodeType.DIRECT,
+                input_keys=["task_input"],
+                task_analysis=analysis,
+            )
+            format_node = create_node(
+                node_id="format_1",
+                node_type=NodeType.FORMAT,
+                input_keys=["task_input", "candidate_answer"],
+                task_analysis=analysis,
+            )
+            finalize = create_node(
+                node_id="finalize_1",
+                node_type=NodeType.FINALIZE,
+                config={"source_key": "formatted_answer"},
+            )
+            return PromptProgram(
+                program_id=template_name,
+                task_id=task_spec.task_id,
+                nodes=[direct, format_node, finalize],
+                edges=[
+                    ProgramEdge(source="direct_1", target="format_1"),
+                    ProgramEdge(source="format_1", target="finalize_1"),
+                ],
+                entry_node_id="direct_1",
+                finalize_node_id="finalize_1",
+                metadata={"seed_template": template_name},
+            )
+        case "critique_revise_finalize":
+            direct = create_node(
+                node_id="direct_1",
+                node_type=NodeType.DIRECT,
+                input_keys=["task_input"],
+                task_analysis=analysis,
+            )
+            critique = create_node(
+                node_id="critique_1",
+                node_type=NodeType.CRITIQUE,
+                input_keys=["task_input", "candidate_answer"],
+                prompt_modules=[
+                    PromptModule(role="instruction", text="Critique the current candidate answer against the task requirements."),
+                    PromptModule(role="format", text="Return a concise critique that identifies concrete issues or says the answer looks good."),
+                ],
+                task_analysis=analysis,
+            )
+            revise = create_node(
+                node_id="revise_1",
+                node_type=NodeType.SOLVE,
+                name="revise",
+                input_keys=["task_input", "candidate_answer", "critique"],
+                prompt_modules=[
+                    PromptModule(
+                        role="instruction",
+                        text=f"Revise the current answer for the {analysis.task_family} task using the critique.",
+                    ),
+                    PromptModule(
+                        role="reasoning",
+                        text="Preserve correct content, fix concrete issues, and keep the answer concise.",
+                    ),
+                    PromptModule(role="format", text="Return an improved candidate answer and a short rationale."),
+                ],
+                task_analysis=analysis,
+            )
+            finalize = create_node(
+                node_id="finalize_1",
+                node_type=NodeType.FINALIZE,
+                config={"source_key": "candidate_answer"},
+            )
+            return PromptProgram(
+                program_id=template_name,
+                task_id=task_spec.task_id,
+                nodes=[direct, critique, revise, finalize],
+                edges=[
+                    ProgramEdge(source="direct_1", target="critique_1"),
+                    ProgramEdge(source="critique_1", target="revise_1"),
+                    ProgramEdge(source="revise_1", target="finalize_1"),
+                ],
                 entry_node_id="direct_1",
                 finalize_node_id="finalize_1",
                 metadata={"seed_template": template_name},
