@@ -749,5 +749,10 @@ def _require_dspy():
     try:
         import dspy  # type: ignore
     except ImportError as exc:  # pragma: no cover - exercised in environments without the extra
-        raise RuntimeError("DSPy baselines require the optional `dspy` extra. Run `uv sync --extra dspy`.") from exc
+        raise RuntimeError(
+            "DSPy baselines require the optional `dspy` extra. "
+            "If you're using `uv run`, add `--extra dspy`, for example "
+            "`uv run --extra dspy python -m topoprompt.cli benchmark-dspy ...`. "
+            "To install it into the project environment, run `uv sync --extra dspy`."
+        ) from exc
     return dspy

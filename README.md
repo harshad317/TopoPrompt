@@ -112,6 +112,12 @@ Install the optional DSPy extra:
 uv sync --extra dspy
 ```
 
+For one-off DSPy CLI runs, include the extra on the `uv run` command too:
+
+```bash
+uv run --extra dspy python -m topoprompt.cli benchmark-dspy ...
+```
+
 If you want to use the OpenAI backend, export an API key first:
 
 ```bash
@@ -280,6 +286,22 @@ Arguments:
 - `--config`: optional config override file
 - `--metric`: evaluation metric
 - `--fake-backend`: use the deterministic fake backend
+
+### DSPy Benchmarks
+
+DSPy commands require the optional `dspy` extra. You can either install it once with
+`uv sync --extra dspy` or include it directly on the run command:
+
+```bash
+uv run --extra dspy python -m topoprompt.cli benchmark-dspy \
+  --benchmark gsm8k \
+  --split "train[:200]" \
+  --output-dir ./runs/gsm8k_three_way \
+  --optimizers topoprompt,mipro,gepa \
+  --model gpt-4.1-mini \
+  --reflection-model gpt-4.1-mini \
+  -v
+```
 
 ## Architecture
 

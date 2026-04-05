@@ -121,6 +121,7 @@ def test_benchmark_runner_compile_and_compare_with_dspy_smoke(monkeypatch, fake_
     monkeypatch.setattr("topoprompt.eval.benchmark_runner.compile_dspy_baseline", fake_compile_dspy_baseline)
     monkeypatch.setattr("topoprompt.eval.benchmark_runner.compare_topoprompt_vs_dspy", fake_compare_topoprompt_vs_dspy)
     monkeypatch.setattr("topoprompt.eval.benchmark_runner.compare_dspy_programs", fake_compare_dspy_programs)
+    monkeypatch.setattr("topoprompt.eval.benchmark_runner._require_dspy", lambda: None)
 
     runner = BenchmarkRunner(config=small_config, backend=fake_backend)
     summary = runner.compile_and_compare_with_dspy(
@@ -153,9 +154,15 @@ def test_benchmark_runner_compile_and_compare_with_dspy_fails_fast_without_dspy(
     small_config,
 ):
     compile_called = False
+    expected_message = (
+        "DSPy baselines require the optional `dspy` extra. "
+        "If you're using `uv run`, add `--extra dspy`, for example "
+        "`uv run --extra dspy python -m topoprompt.cli benchmark-dspy ...`. "
+        "To install it into the project environment, run `uv sync --extra dspy`."
+    )
 
     def fail_without_dspy():
-        raise RuntimeError("DSPy baselines require the optional `dspy` extra. Run `uv sync --extra dspy`.")
+        raise RuntimeError(expected_message)
 
     def fake_compile_task(**kwargs):
         nonlocal compile_called
@@ -166,7 +173,7 @@ def test_benchmark_runner_compile_and_compare_with_dspy_fails_fast_without_dspy(
     monkeypatch.setattr("topoprompt.eval.benchmark_runner.compile_task", fake_compile_task)
 
     runner = BenchmarkRunner(config=small_config, backend=fake_backend)
-    with pytest.raises(RuntimeError, match="optional `dspy` extra"):
+    with pytest.raises(RuntimeError, match="uv run.*--extra dspy"):
         runner.compile_and_compare_with_dspy(
             benchmark_name="gsm8k",
             optimizers="topoprompt,mipro,gepa",
