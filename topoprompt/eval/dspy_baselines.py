@@ -175,7 +175,10 @@ def evaluate_dspy_program_on_examples(
     estimated_invocations = int(getattr(program, "_topoprompt_estimated_invocations", 1))
     dspy_examples = _to_dspy_examples(dspy, examples, input_keys=input_keys)
     resolved_model_name = model_name or getattr(program, "_topoprompt_model_name", None) or config.model.name
-    lm = _build_dspy_lm(dspy=dspy, model_name=resolved_model_name, config=config)
+    # Always disable cache for final evaluation to prevent compile-phase cache hits
+    # from inflating DSPy scores (examples seen during compile get cached, then
+    # eval re-uses those cached responses → artificially perfect scores).
+    lm = _build_dspy_lm(dspy=dspy, model_name=resolved_model_name, config=config, cache=False)
     program_id = str(getattr(program, "_topoprompt_program_id", program.__class__.__name__))
 
     reporter.rule(f"Evaluate DSPy Program: {program_id}", level=1, style="bold blue")
@@ -612,12 +615,13 @@ def _build_gepa_feedback(*, example: Example, prediction_value: Any, score: floa
     return f"Incorrect output. Expected {expected} but got {got}. Improve the final answer."
 
 
-def _build_dspy_lm(*, dspy: Any, model_name: str, config: TopoPromptConfig) -> Any:
+def _build_dspy_lm(*, dspy: Any, model_name: str, config: TopoPromptConfig, cache: bool | None = None) -> Any:
+    use_cache = config.runtime.cache_enabled if cache is None else cache
     return dspy.LM(
         _normalize_dspy_model_name(model_name),
         temperature=config.model.temperature,
         max_tokens=config.model.max_output_tokens,
-        cache=config.runtime.cache_enabled,
+        cache=use_cache,
     )
 
 
