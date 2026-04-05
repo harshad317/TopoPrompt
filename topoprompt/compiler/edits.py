@@ -15,6 +15,9 @@ _DESTRUCTIVE_STRUCTURAL_EDIT_TYPES: frozenset[str] = frozenset({
     "delete_node",
     "insert_plan_before",
     "change_finalize_format",
+    # Dropping fewshots from a high-scoring program almost always degrades it;
+    # block it so the optimizer can't produce degenerate add→drop no-op cycles.
+    "drop_fewshot_module",
 })
 
 # Programs scoring at or above this threshold are considered high-performing.
@@ -619,13 +622,19 @@ def _add_finalize_format_edit(edits: list[CandidateEdit], instruction: str) -> N
 
 def _add_fewshot_edits(edits: list[CandidateEdit], program: PromptProgram) -> None:
     if _has_fewshot_module(program):
-        _add_edit(
-            edits,
-            CandidateEdit(
-                edit_type="drop_fewshot_module",
-                reason="Remove few-shot guidance if it is adding noise.",
-            ),
-        )
+        # Only propose dropping fewshots if they were NOT recently added by the
+        # optimizer itself (i.e. "add_fewshot_module" is not in the program's
+        # edit chain).  This prevents the add→drop no-op seesaw where the
+        # optimizer adds fewshots, evaluates them on a small screening set,
+        # then immediately proposes removing them in the next round.
+        if "add_fewshot_module" not in program.program_id:
+            _add_edit(
+                edits,
+                CandidateEdit(
+                    edit_type="drop_fewshot_module",
+                    reason="Remove few-shot guidance if it is adding noise.",
+                ),
+            )
     else:
         _add_edit(
             edits,
