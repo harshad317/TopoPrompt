@@ -64,6 +64,7 @@ def write_compile_artifact(artifact: CompileArtifact, output_dir: str | Path) ->
 
 def _render_summary(artifact: CompileArtifact) -> str:
     metrics = artifact.metrics
+    compile_warnings = artifact.task_spec.metadata.get("compile_warnings") or []
     lines = [
         "# TopoPrompt Compile Summary",
         "",
@@ -84,4 +85,7 @@ def _render_summary(artifact: CompileArtifact) -> str:
     ]
     for phase in metrics.spent_budget_by_phase:
         lines.append(f"- `{phase.phase}`: spent {phase.spent_calls}/{phase.planned_calls}")
+    if compile_warnings:
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- {warning}" for warning in compile_warnings)
     return "\n".join(lines) + "\n"
