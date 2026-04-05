@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 from statistics import mean
 from typing import Any, Callable
 
@@ -109,6 +110,16 @@ def compile_task(
         reporter=reporter,
     )
     reporter.print_analysis(analysis)
+    compile_warnings = _build_compile_warnings(
+        task_spec=task_spec,
+        examples=partitions.search_examples,
+        metric_name=metric_name,
+        analysis=analysis,
+    )
+    if compile_warnings:
+        task_spec.metadata["compile_warnings"] = compile_warnings
+        for warning in compile_warnings:
+            reporter.log(f"Warning: {warning}")
     seed_names = (analysis.initial_seed_templates or SEED_LIBRARY)[:5]
     reporter.log(f"Selected seed templates: {', '.join(seed_names)}")
     seed_programs = instantiate_seed_programs(
@@ -474,6 +485,35 @@ def _run_analysis(
     return analysis
 
 
+def _build_compile_warnings(
+    *,
+    task_spec: TaskSpec,
+    examples: list[Example],
+    metric_name: str,
+    analysis: TaskAnalysis,
+) -> list[str]:
+    warnings: list[str] = []
+    normalized_metric = metric_name.lower()
+    description = task_spec.description.lower()
+    target_samples = [str(example.target).strip() for example in examples if example.target is not None][:20]
+    if normalized_metric in {"exact_match", "accuracy"} and _looks_like_free_form_generation(
+        task_family=analysis.task_family,
+        target_samples=target_samples,
+    ):
+        warnings.append(
+            "`exact_match` in TopoPrompt is strict normalized string equality. For free-form generation tasks like summarization, a score near 0.0 often reflects the metric more than the topology."
+        )
+    if normalized_metric in {"exact_match", "accuracy"} and (
+        analysis.output_format == "bullet_points" or _description_requests_bullets(description)
+    ):
+        bullet_ratio = _bullet_target_ratio(target_samples)
+        if target_samples and bullet_ratio < 0.5:
+            warnings.append(
+                "The task asks for bullet-point output, but most reference targets are not bullet-formatted. Under `exact_match`, formatting differences alone can zero out otherwise reasonable answers."
+            )
+    return warnings
+
+
 def _evaluate_candidate(
     *,
     program: PromptProgram,
@@ -587,6 +627,34 @@ def _evaluate_candidate(
     if reporter is not None:
         reporter.log_candidate(candidate, prefix=f"{stage} ", level=2)
     return candidate
+
+
+def _looks_like_free_form_generation(*, task_family: str, target_samples: list[str]) -> bool:
+    if task_family in {"summarization", "translation", "generation", "rewriting"}:
+        return True
+    normalized_targets = [_normalize_text(sample) for sample in target_samples if sample]
+    if not normalized_targets:
+        return False
+    unique_targets = set(normalized_targets)
+    short_label_set = len(unique_targets) <= 10 and all(len(sample.split()) <= 3 for sample in unique_targets)
+    if short_label_set:
+        return False
+    return mean(len(sample.split()) for sample in normalized_targets) >= 8
+
+
+def _description_requests_bullets(description: str) -> bool:
+    return any(keyword in description for keyword in ["bullet", "bulleted", "bullet-point", "bullet point"])
+
+
+def _bullet_target_ratio(target_samples: list[str]) -> float:
+    if not target_samples:
+        return 0.0
+    bullet_like = sum(1 for sample in target_samples if re.search(r"(?m)^\s*[-*+]\s+\S", sample))
+    return bullet_like / len(target_samples)
+
+
+def _normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
 
 
 def _evaluate_candidates_multi_fidelity(
