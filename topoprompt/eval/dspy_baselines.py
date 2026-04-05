@@ -179,6 +179,18 @@ def evaluate_dspy_program_on_examples(
     # from inflating DSPy scores (examples seen during compile get cached, then
     # eval re-uses those cached responses → artificially perfect scores).
     lm = _build_dspy_lm(dspy=dspy, model_name=resolved_model_name, config=config, cache=False)
+    # Also flush litellm's in-process cache to ensure no in-memory hits survive
+    # from the compile phase within the same process.
+    try:
+        import litellm
+        if hasattr(litellm, "cache") and litellm.cache is not None:
+            try:
+                litellm.cache.flush_cache()
+            except Exception:
+                pass
+        litellm.cache = None
+    except ImportError:
+        pass
     program_id = str(getattr(program, "_topoprompt_program_id", program.__class__.__name__))
 
     reporter.rule(f"Evaluate DSPy Program: {program_id}", level=1, style="bold blue")

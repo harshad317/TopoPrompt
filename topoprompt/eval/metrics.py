@@ -71,8 +71,6 @@ def multiple_choice_metric(prediction: Any, example: Example) -> float:
         return 0.0
     if pred == target:
         return 1.0
-    if pred[:1] == target[:1]:
-        return 1.0
     return 0.0
 
 
