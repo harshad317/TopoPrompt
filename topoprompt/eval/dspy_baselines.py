@@ -344,6 +344,114 @@ def compare_topoprompt_vs_dspy(
     return summary
 
 
+def compare_dspy_programs(
+    *,
+    program_a: Any,
+    program_b: Any,
+    task_spec: TaskSpec,
+    examples: list[Example],
+    metric_fn: MetricFn,
+    config: TopoPromptConfig,
+    model_name_a: str | None = None,
+    model_name_b: str | None = None,
+    label_a: str = "dspy_a",
+    label_b: str = "dspy_b",
+    repeats: int = 1,
+    output_dir: str | Path | None = None,
+    confidence_level: float = 0.95,
+    bootstrap_samples: int = 10000,
+    bootstrap_seed: int = 0,
+    show_progress: bool = False,
+    progress_verbosity: int = 1,
+    progress_reporter: CompileProgressReporter | None = None,
+) -> dict[str, Any]:
+    if repeats < 1:
+        raise ValueError("repeats must be at least 1")
+
+    reporter = progress_reporter or CompileProgressReporter(enabled=show_progress, verbosity=progress_verbosity)
+    out_dir = Path(output_dir) if output_dir is not None else None
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    repeat_results: list[dict[str, Any]] = []
+    disagreement_rows_by_repeat: list[list[dict[str, Any]]] = []
+    program_a_ref = _ProgramRef(str(getattr(program_a, "_topoprompt_program_id", program_a.__class__.__name__)))
+    program_b_ref = _ProgramRef(str(getattr(program_b, "_topoprompt_program_id", program_b.__class__.__name__)))
+
+    for repeat_index in range(repeats):
+        if repeats > 1:
+            reporter.rule(f"Compare Repeat {repeat_index + 1}", level=1, style="bold blue")
+        config_a = _comparison_config(config=config, repeat_index=repeat_index + 1, side="a", output_dir=out_dir)
+        config_b = _comparison_config(config=config, repeat_index=repeat_index + 1, side="b", output_dir=out_dir)
+        reporter.log(f"Evaluating {label_a}: {program_a_ref.program_id}", level=1)
+        result_a = evaluate_dspy_program_on_examples(
+            program=program_a,
+            task_spec=task_spec,
+            examples=examples,
+            metric_fn=metric_fn,
+            config=config_a,
+            model_name=model_name_a or config.model.name,
+            show_progress=show_progress,
+            progress_verbosity=progress_verbosity,
+            progress_reporter=reporter,
+        )
+        reporter.log(f"Evaluating {label_b}: {program_b_ref.program_id}", level=1)
+        result_b = evaluate_dspy_program_on_examples(
+            program=program_b,
+            task_spec=task_spec,
+            examples=examples,
+            metric_fn=metric_fn,
+            config=config_b,
+            model_name=model_name_b or config.model.name,
+            show_progress=show_progress,
+            progress_verbosity=progress_verbosity,
+            progress_reporter=reporter,
+        )
+        repeat_summary, disagreement_rows = _compare_repeat_results(
+            repeat_index=repeat_index + 1,
+            label_a=label_a,
+            label_b=label_b,
+            program_a=program_a_ref,
+            program_b=program_b_ref,
+            examples=examples,
+            result_a=result_a,
+            result_b=result_b,
+        )
+        repeat_results.append(repeat_summary)
+        disagreement_rows_by_repeat.append(disagreement_rows)
+
+    summary = _build_compare_summary(
+        label_a=label_a,
+        label_b=label_b,
+        program_a=program_a_ref,
+        program_b=program_b_ref,
+        sample_count=len(examples),
+        repeat_results=repeat_results,
+    )
+    significance = build_significance_summary(
+        label_a=label_a,
+        label_b=label_b,
+        program_a_id=program_a_ref.program_id,
+        program_b_id=program_b_ref.program_id,
+        sample_count=len(examples),
+        repeat_results=repeat_results,
+        confidence_level=confidence_level,
+        bootstrap_samples=bootstrap_samples,
+        bootstrap_seed=bootstrap_seed,
+    )
+    summary["significance"] = significance
+
+    if out_dir is not None:
+        _write_json(out_dir / "compare_summary.json", summary)
+        _write_jsonl(out_dir / "repeat_metrics.jsonl", repeat_results)
+        for repeat_result, disagreement_rows in zip(repeat_results, disagreement_rows_by_repeat, strict=False):
+            _write_jsonl(out_dir / f"disagreements_repeat_{repeat_result['repeat_index']}.jsonl", disagreement_rows)
+        (out_dir / "compare_summary.md").write_text(_render_compare_summary(summary))
+        _write_json(out_dir / "significance_summary.json", significance)
+        (out_dir / "significance_summary.md").write_text(render_significance_summary(significance))
+    return summary
+
+
 def load_dspy_program(
     *,
     state_path: str | Path,

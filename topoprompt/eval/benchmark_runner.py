@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
+from itertools import combinations
 from statistics import mean, pstdev
 from typing import Any
 
@@ -12,7 +13,7 @@ from topoprompt.compiler.seeds import instantiate_seed_program
 from topoprompt.compiler.search import compile_task, evaluate_program_on_examples
 from topoprompt.config import TopoPromptConfig
 from topoprompt.eval.compare import compare_programs
-from topoprompt.eval.dspy_baselines import compare_topoprompt_vs_dspy, compile_dspy_baseline
+from topoprompt.eval.dspy_baselines import compare_dspy_programs, compare_topoprompt_vs_dspy, compile_dspy_baseline
 from topoprompt.eval.datasets import load_benchmark_examples, partition_examples
 from topoprompt.eval.metrics import metric_for_name
 from topoprompt.eval.significance import build_significance_summary
@@ -356,6 +357,8 @@ class BenchmarkRunner:
         )
 
         comparison_summaries: dict[str, dict[str, Any]] = {}
+        pairwise_comparisons: dict[str, dict[str, Any]] = {}
+        dspy_runs: dict[str, dict[str, Any]] = {}
         for optimizer_name in normalized_optimizers:
             dspy_dir = out_dir / f"dspy_{optimizer_name}" if out_dir is not None else None
             dspy_result = compile_dspy_baseline(
@@ -373,6 +376,7 @@ class BenchmarkRunner:
                 show_progress=show_progress,
                 progress_verbosity=progress_verbosity,
             )
+            dspy_runs[optimizer_name] = dspy_result
             compare_dir = out_dir / f"compare_topoprompt_vs_{optimizer_name}" if out_dir is not None else None
             compare_summary = compare_topoprompt_vs_dspy(
                 topoprompt_program=artifact.program_ir,
@@ -390,6 +394,17 @@ class BenchmarkRunner:
                 show_progress=show_progress,
                 progress_verbosity=progress_verbosity,
             )
+            pairwise_comparisons[f"topoprompt_vs_{optimizer_name}"] = {
+                "label_a": "topoprompt",
+                "label_b": optimizer_name,
+                "program_a_id": compare_summary["program_a_id"],
+                "program_b_id": compare_summary["program_b_id"],
+                "score_a": compare_summary["score_a_mean"],
+                "score_b": compare_summary["score_b_mean"],
+                "delta_a_minus_b": compare_summary["score_delta_a_minus_b_mean"],
+                "mcnemar_exact_p_value": _compare_p_value(compare_summary),
+                "compare_output_dir": str(compare_dir) if compare_dir is not None else None,
+            }
             comparison_summaries[optimizer_name] = {
                 "optimizer_name": optimizer_name,
                 "dspy_program_id": dspy_result["summary"]["program_id"],
@@ -400,6 +415,36 @@ class BenchmarkRunner:
                 "topoprompt_minus_dspy": compare_summary["score_delta_a_minus_b_mean"],
                 "mcnemar_exact_p_value": _compare_p_value(compare_summary),
                 "dspy_output_dir": str(dspy_dir) if dspy_dir is not None else None,
+                "compare_output_dir": str(compare_dir) if compare_dir is not None else None,
+            }
+
+        for optimizer_a, optimizer_b in combinations(normalized_optimizers, 2):
+            compare_dir = out_dir / f"compare_{optimizer_a}_vs_{optimizer_b}" if out_dir is not None else None
+            compare_summary = compare_dspy_programs(
+                program_a=dspy_runs[optimizer_a]["program"],
+                program_b=dspy_runs[optimizer_b]["program"],
+                task_spec=artifact.task_spec,
+                examples=eval_examples,
+                metric_fn=metric_fn,
+                config=self.config,
+                model_name_a=model_name or self.config.model.name,
+                model_name_b=model_name or self.config.model.name,
+                label_a=optimizer_a,
+                label_b=optimizer_b,
+                repeats=compare_repeats,
+                output_dir=compare_dir,
+                show_progress=show_progress,
+                progress_verbosity=progress_verbosity,
+            )
+            pairwise_comparisons[f"{optimizer_a}_vs_{optimizer_b}"] = {
+                "label_a": optimizer_a,
+                "label_b": optimizer_b,
+                "program_a_id": compare_summary["program_a_id"],
+                "program_b_id": compare_summary["program_b_id"],
+                "score_a": compare_summary["score_a_mean"],
+                "score_b": compare_summary["score_b_mean"],
+                "delta_a_minus_b": compare_summary["score_delta_a_minus_b_mean"],
+                "mcnemar_exact_p_value": _compare_p_value(compare_summary),
                 "compare_output_dir": str(compare_dir) if compare_dir is not None else None,
             }
 
@@ -418,6 +463,7 @@ class BenchmarkRunner:
                 "output_dir": str(topoprompt_dir) if topoprompt_dir is not None else artifact.output_dir,
             },
             "comparisons": comparison_summaries,
+            "pairwise_comparisons": pairwise_comparisons,
         }
         if out_dir is not None:
             _write_json(out_dir / "benchmark_dspy_summary.json", summary)
@@ -644,17 +690,30 @@ def _render_benchmark_dspy_summary(summary: dict[str, Any]) -> str:
         f"- TopoPrompt program: `{summary['topoprompt']['program_id']}`",
         f"- TopoPrompt validation score: `{summary['topoprompt']['validation_score']:.4f}`",
         "",
-        "## Comparisons",
+        "## Systems",
         "",
-        "| Optimizer | DSPy Program | Student | TopoPrompt | DSPy | Delta | p |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: |",
+        "| System | Program | Student | Compile Seconds |",
+        "| --- | --- | --- | ---: |",
+        f"| topoprompt | {summary['topoprompt']['program_id']} | - | - |",
     ]
     for optimizer_name, payload in summary["comparisons"].items():
         lines.append(
             "| "
             f"{optimizer_name} | {payload['dspy_program_id']} | {payload['student_strategy']} | "
-            f"{payload['topoprompt_score']:.4f} | {payload['dspy_score']:.4f} | "
-            f"{payload['topoprompt_minus_dspy']:+.4f} | {payload['mcnemar_exact_p_value']} |"
+            f"{payload['compile_seconds']:.2f} |"
+        )
+    lines.extend([
+        "",
+        "## Pairwise Comparisons",
+        "",
+        "| Pair | Score A | Score B | Delta (A - B) | p |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ])
+    for pair_name, payload in summary["pairwise_comparisons"].items():
+        lines.append(
+            "| "
+            f"{pair_name} | {payload['score_a']:.4f} | {payload['score_b']:.4f} | "
+            f"{payload['delta_a_minus_b']:+.4f} | {payload['mcnemar_exact_p_value']} |"
         )
     return "\n".join(lines) + "\n"
 

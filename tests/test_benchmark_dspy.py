@@ -95,9 +95,28 @@ def test_benchmark_runner_compile_and_compare_with_dspy_smoke(monkeypatch, fake_
             },
         }
 
+    def fake_compare_dspy_programs(**kwargs):
+        return {
+            "label_a": kwargs["label_a"],
+            "label_b": kwargs["label_b"],
+            "program_a_id": getattr(kwargs["program_a"], "_topoprompt_program_id"),
+            "program_b_id": getattr(kwargs["program_b"], "_topoprompt_program_id"),
+            "sample_count": len(kwargs["examples"]),
+            "repeats": 1,
+            "score_a_mean": 0.66,
+            "score_b_mean": 0.62,
+            "score_delta_a_minus_b_mean": 0.04,
+            "significance": {
+                "repeat_results": [
+                    {"mcnemar_exact_p_value": 0.75},
+                ]
+            },
+        }
+
     monkeypatch.setattr("topoprompt.eval.benchmark_runner.compile_task", fake_compile_task)
     monkeypatch.setattr("topoprompt.eval.benchmark_runner.compile_dspy_baseline", fake_compile_dspy_baseline)
     monkeypatch.setattr("topoprompt.eval.benchmark_runner.compare_topoprompt_vs_dspy", fake_compare_topoprompt_vs_dspy)
+    monkeypatch.setattr("topoprompt.eval.benchmark_runner.compare_dspy_programs", fake_compare_dspy_programs)
 
     runner = BenchmarkRunner(config=small_config, backend=fake_backend)
     summary = runner.compile_and_compare_with_dspy(
@@ -111,7 +130,13 @@ def test_benchmark_runner_compile_and_compare_with_dspy_smoke(monkeypatch, fake_
     assert summary["task_family"] == "classification"
     assert summary["topoprompt"]["program_id"] == "compiled_prog"
     assert set(summary["comparisons"]) == {"mipro", "gepa"}
+    assert set(summary["pairwise_comparisons"]) == {
+        "topoprompt_vs_mipro",
+        "topoprompt_vs_gepa",
+        "mipro_vs_gepa",
+    }
     assert summary["comparisons"]["mipro"]["topoprompt_score"] == 0.78
     assert summary["comparisons"]["gepa"]["dspy_score"] == 0.62
+    assert summary["pairwise_comparisons"]["mipro_vs_gepa"]["delta_a_minus_b"] == 0.04
     assert (tmp_path / "sst2_dspy_run" / "benchmark_dspy_summary.json").exists()
     assert (tmp_path / "sst2_dspy_run" / "benchmark_dspy_summary.md").exists()
