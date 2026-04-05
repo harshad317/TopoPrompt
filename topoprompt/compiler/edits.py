@@ -12,53 +12,123 @@ def generate_heuristic_edits(
     analysis: TaskAnalysis,
     config: TopoPromptConfig,
 ) -> list[CandidateEdit]:
-    node_types = {node.node_type for node in program.nodes}
+    _reset_edit_dedupe()
+    family = analysis.task_family or "other"
     edits: list[CandidateEdit] = []
-
-    if analysis.needs_verification and NodeType.VERIFY not in node_types:
-        target = _last_answer_node(program)
-        if target:
-            edits.append(CandidateEdit(edit_type="insert_verify_after", target_node_id=target))
-
-    if analysis.needs_reasoning and NodeType.PLAN not in node_types:
-        solve_nodes = [node.node_id for node in program.nodes if node.node_type == NodeType.SOLVE]
-        if solve_nodes:
-            edits.append(CandidateEdit(edit_type="insert_plan_before", target_node_id=solve_nodes[0]))
-        else:
-            direct_nodes = [node.node_id for node in program.nodes if node.node_type == NodeType.DIRECT]
-            if direct_nodes:
-                edits.append(
-                    CandidateEdit(
-                        edit_type="replace_node_type",
-                        target_node_id=direct_nodes[0],
-                        new_node_type=NodeType.SOLVE,
-                    )
-                )
-
-    if analysis.input_heterogeneity in {"medium", "high"} and NodeType.ROUTE not in node_types:
-        answer_target = _entry_answerish_node(program)
-        if answer_target:
-            edits.append(CandidateEdit(edit_type="split_with_route", target_node_id=answer_target))
-
-    edits.append(CandidateEdit(edit_type="rewrite_prompt_module", rewrite_instruction="Make the instructions more task-specific."))
-    edits.append(CandidateEdit(edit_type="change_finalize_format", rewrite_instruction="Return only the final answer."))
-
-    if NodeType.ROUTE in node_types:
-        route_node = next(node.node_id for node in program.nodes if node.node_type == NodeType.ROUTE)
-        edits.append(CandidateEdit(edit_type="swap_branch_target", target_node_id=route_node))
-        edits.append(CandidateEdit(edit_type="remove_route", target_node_id=route_node))
-
-    if NodeType.VERIFY in node_types:
-        verify_node = next(node.node_id for node in program.nodes if node.node_type == NodeType.VERIFY)
-        edits.append(CandidateEdit(edit_type="delete_node", target_node_id=verify_node))
-
-    if NodeType.VERIFY not in node_types:
-        target = _last_answer_node(program)
-        if target:
-            edits.append(CandidateEdit(edit_type="add_node", target_node_id=target, new_node_type=NodeType.VERIFY))
-
-    edits.append(CandidateEdit(edit_type="add_fewshot_module"))
-    edits.append(CandidateEdit(edit_type="drop_fewshot_module"))
+    if family == "classification":
+        _add_route_split_edit(edits, program, analysis)
+        _add_targeted_rewrite(
+            edits,
+            program,
+            target_node_id=_last_candidate_node(program),
+            instruction="Choose the best label from the task's label space and avoid extra explanation.",
+        )
+        _add_finalize_format_edit(edits, "Return only the final label.")
+        _add_route_tuning_edits(edits, program)
+        _add_verify_cleanup_edit(edits, program)
+        _add_fewshot_edits(edits, program)
+    elif family == "extraction":
+        _add_format_insertion_edit(edits, program)
+        _add_route_split_edit(edits, program, analysis)
+        _add_targeted_rewrite(
+            edits,
+            program,
+            target_node_id=_last_candidate_node(program),
+            module_role="format",
+            instruction="Preserve the requested field names and keep extracted values faithful to the input.",
+        )
+        _add_finalize_format_edit(edits, "Return only valid JSON matching the requested schema.")
+        _add_verify_insertion_edit(edits, program, analysis)
+        _add_fewshot_edits(edits, program)
+    elif family == "instruction_following":
+        if analysis.output_format == "json":
+            _add_format_insertion_edit(edits, program)
+        _add_verify_insertion_edit(edits, program, analysis)
+        _add_targeted_rewrite(
+            edits,
+            program,
+            target_node_id=_last_candidate_node(program),
+            instruction="Satisfy every stated instruction before answering.",
+        )
+        _add_finalize_format_edit(
+            edits,
+            f"Return only the requested {analysis.output_format.replace('_', ' ')} response.",
+        )
+        _add_route_split_edit(edits, program, analysis)
+        _add_fewshot_edits(edits, program)
+    elif family in {"generation", "summarization"}:
+        _add_critique_revise_insertion_edit(edits, program)
+        _add_targeted_rewrite(
+            edits,
+            program,
+            target_node_id=_last_candidate_node(program),
+            instruction="Improve clarity, specificity, and overall answer quality while staying faithful to the task.",
+        )
+        _add_targeted_rewrite(
+            edits,
+            program,
+            target_node_id=_first_node_of_type(program, NodeType.CRITIQUE),
+            instruction="Identify the most important weaknesses before revising.",
+        )
+        _add_route_split_edit(edits, program, analysis)
+        _add_verify_cleanup_edit(edits, program)
+        _add_fewshot_edits(edits, program)
+    elif family == "code":
+        _add_critique_revise_insertion_edit(edits, program)
+        _add_verify_insertion_edit(edits, program, analysis)
+        _add_solve_upgrade_edit(edits, program)
+        _add_targeted_rewrite(
+            edits,
+            program,
+            target_node_id=_last_candidate_node(program),
+            instruction="Return correct, executable code that handles the important edge cases.",
+        )
+        _add_targeted_rewrite(
+            edits,
+            program,
+            target_node_id=_first_node_of_type(program, NodeType.VERIFY),
+            module_role="verification",
+            instruction="Check correctness, edge cases, and required output format before finalizing.",
+        )
+        _add_fewshot_edits(edits, program)
+    elif family in {"math_reasoning", "reasoning"}:
+        _add_verify_insertion_edit(edits, program, analysis)
+        _add_reasoning_structure_edits(edits, program, analysis)
+        _add_route_split_edit(edits, program, analysis)
+        _add_targeted_rewrite(
+            edits,
+            program,
+            target_node_id=_last_candidate_node(program),
+            instruction="Reason carefully and keep the final answer exact.",
+        )
+        _add_finalize_format_edit(edits, "Return only the final answer.")
+        _add_route_tuning_edits(edits, program)
+        _add_fewshot_edits(edits, program)
+    elif family == "mixed":
+        _add_format_insertion_edit(edits, program)
+        _add_critique_revise_insertion_edit(edits, program)
+        _add_verify_insertion_edit(edits, program, analysis)
+        _add_route_split_edit(edits, program, analysis)
+        _add_targeted_rewrite(
+            edits,
+            program,
+            target_node_id=_last_candidate_node(program),
+            instruction="Handle the heterogeneous cases explicitly and preserve correctness across branches.",
+        )
+        _add_fewshot_edits(edits, program)
+    else:
+        _add_verify_insertion_edit(edits, program, analysis)
+        _add_reasoning_structure_edits(edits, program, analysis)
+        _add_route_split_edit(edits, program, analysis)
+        _add_targeted_rewrite(
+            edits,
+            program,
+            target_node_id=_last_candidate_node(program),
+            instruction="Make the instructions more task-specific.",
+        )
+        _add_finalize_format_edit(edits, "Return only the final answer.")
+        _add_route_tuning_edits(edits, program)
+        _add_fewshot_edits(edits, program)
 
     return edits[: config.compile.max_candidates_per_parent]
 
@@ -80,7 +150,7 @@ def apply_edit(
             new_node = create_node(
                 node_id=_next_node_id(candidate, edit.new_node_type),
                 node_type=edit.new_node_type,
-                input_keys=["task_input", "candidate_answer"] if edit.new_node_type == NodeType.VERIFY else ["task_input"],
+                input_keys=_default_insert_input_keys(edit.new_node_type),
                 task_analysis=analysis,
             )
             _insert_after(candidate, edit.target_node_id, new_node)
@@ -144,6 +214,52 @@ def apply_edit(
             _drop_fewshot_module(candidate)
         case "change_finalize_format":
             _change_finalize_format(candidate, edit.rewrite_instruction or "Return only the final answer.")
+        case "insert_format_after":
+            target = edit.target_node_id or _last_candidate_node(candidate)
+            if target is None:
+                raise ValueError("insert_format_after requires target_node_id or an answer-producing node")
+            new_node = create_node(
+                node_id=_next_node_id(candidate, NodeType.FORMAT),
+                node_type=NodeType.FORMAT,
+                input_keys=["task_input", "candidate_answer"],
+                task_analysis=analysis,
+            )
+            _insert_after(candidate, target, new_node)
+            candidate.node_map()[candidate.finalize_node_id].config["source_key"] = "formatted_answer"
+        case "insert_critique_revise_after":
+            target = edit.target_node_id or _last_candidate_node(candidate)
+            if target is None:
+                raise ValueError("insert_critique_revise_after requires target_node_id or an answer-producing node")
+            critique = create_node(
+                node_id=_next_node_id(candidate, NodeType.CRITIQUE),
+                node_type=NodeType.CRITIQUE,
+                input_keys=["task_input", "candidate_answer"],
+                prompt_modules=[
+                    PromptModule(role="instruction", text="Identify the most important weaknesses in the current candidate answer."),
+                    PromptModule(role="format", text="Return a concise critique grounded in the task requirements."),
+                ],
+                task_analysis=analysis,
+            )
+            _insert_after(candidate, target, critique)
+            revise = create_node(
+                node_id=_next_node_id(candidate, NodeType.SOLVE),
+                node_type=NodeType.SOLVE,
+                name="revise",
+                input_keys=["task_input", "candidate_answer", "critique"],
+                prompt_modules=[
+                    PromptModule(
+                        role="instruction",
+                        text=f"Revise the current answer for the {analysis.task_family} task using the critique.",
+                    ),
+                    PromptModule(
+                        role="reasoning",
+                        text="Keep what is correct, fix what is wrong, and improve the final answer quality.",
+                    ),
+                    PromptModule(role="format", text="Return an improved candidate answer and a short rationale."),
+                ],
+                task_analysis=analysis,
+            )
+            _insert_after(candidate, critique.node_id, revise)
         case "remove_verify":
             verify_nodes = [node.node_id for node in candidate.nodes if node.node_type == NodeType.VERIFY]
             if verify_nodes:
@@ -284,6 +400,214 @@ def _rewrite_prompt_module(program: PromptProgram, edit: CandidateEdit) -> None:
                 return
 
 
+def _default_insert_input_keys(node_type: NodeType) -> list[str]:
+    if node_type in {NodeType.VERIFY, NodeType.CRITIQUE, NodeType.FORMAT}:
+        return ["task_input", "candidate_answer"]
+    return ["task_input"]
+
+
+def _add_edit(edits: list[CandidateEdit], edit: CandidateEdit | None) -> None:
+    if edit is None:
+        return
+    key = (
+        edit.edit_type,
+        edit.target_node_id,
+        edit.new_node_type.value if edit.new_node_type else None,
+        edit.module_role,
+        tuple(edit.branch_labels or []),
+        edit.rewrite_instruction,
+    )
+    seen = getattr(_add_edit, "_seen", None)
+    if seen is None or not isinstance(seen, set):
+        _add_edit._seen = set()
+        seen = _add_edit._seen
+    if key in seen:
+        return
+    seen.add(key)
+    edits.append(edit)
+
+
+def _reset_edit_dedupe() -> None:
+    _add_edit._seen = set()
+
+
+def _add_verify_insertion_edit(edits: list[CandidateEdit], program: PromptProgram, analysis: TaskAnalysis) -> None:
+    if not analysis.needs_verification or any(node.node_type == NodeType.VERIFY for node in program.nodes):
+        return
+    target = _last_answer_node(program)
+    if target:
+        _add_edit(
+            edits,
+            CandidateEdit(
+                edit_type="insert_verify_after",
+                target_node_id=target,
+                reason="Add an explicit verification pass for constraint-heavy tasks.",
+            ),
+        )
+
+
+def _add_reasoning_structure_edits(edits: list[CandidateEdit], program: PromptProgram, analysis: TaskAnalysis) -> None:
+    if not analysis.needs_reasoning or any(node.node_type == NodeType.PLAN for node in program.nodes):
+        return
+    solve_nodes = [node.node_id for node in program.nodes if node.node_type == NodeType.SOLVE]
+    if solve_nodes:
+        _add_edit(
+            edits,
+            CandidateEdit(
+                edit_type="insert_plan_before",
+                target_node_id=solve_nodes[0],
+                reason="Add an explicit planning step before the main solve node.",
+            ),
+        )
+        return
+    _add_solve_upgrade_edit(edits, program)
+
+
+def _add_solve_upgrade_edit(edits: list[CandidateEdit], program: PromptProgram) -> None:
+    direct_nodes = [node.node_id for node in program.nodes if node.node_type == NodeType.DIRECT]
+    solve_nodes = [node.node_id for node in program.nodes if node.node_type == NodeType.SOLVE]
+    if solve_nodes or not direct_nodes:
+        return
+    _add_edit(
+        edits,
+        CandidateEdit(
+            edit_type="replace_node_type",
+            target_node_id=direct_nodes[0],
+            new_node_type=NodeType.SOLVE,
+            reason="Upgrade the direct answer node into a solve node.",
+        ),
+    )
+
+
+def _add_route_split_edit(edits: list[CandidateEdit], program: PromptProgram, analysis: TaskAnalysis) -> None:
+    if analysis.input_heterogeneity not in {"medium", "high"} or any(node.node_type == NodeType.ROUTE for node in program.nodes):
+        return
+    answer_target = _entry_answerish_node(program)
+    if answer_target:
+        _add_edit(
+            edits,
+            CandidateEdit(
+                edit_type="split_with_route",
+                target_node_id=answer_target,
+                reason="Route heterogeneous inputs to specialized answer paths.",
+            ),
+        )
+
+
+def _add_route_tuning_edits(edits: list[CandidateEdit], program: PromptProgram) -> None:
+    route_node = _first_node_of_type(program, NodeType.ROUTE)
+    if route_node is None:
+        return
+    _add_edit(edits, CandidateEdit(edit_type="swap_branch_target", target_node_id=route_node, reason="Swap route targets to test a better branch mapping."))
+    _add_edit(edits, CandidateEdit(edit_type="remove_route", target_node_id=route_node, reason="Remove routing if branching is adding unnecessary complexity."))
+
+
+def _add_verify_cleanup_edit(edits: list[CandidateEdit], program: PromptProgram) -> None:
+    verify_node = _first_node_of_type(program, NodeType.VERIFY)
+    if verify_node is None:
+        return
+    _add_edit(
+        edits,
+        CandidateEdit(
+            edit_type="delete_node",
+            target_node_id=verify_node,
+            reason="Remove a verification pass that may be wasting budget on low-risk tasks.",
+        ),
+    )
+
+
+def _add_format_insertion_edit(edits: list[CandidateEdit], program: PromptProgram) -> None:
+    if any(node.node_type == NodeType.FORMAT for node in program.nodes):
+        return
+    target = _last_candidate_node(program)
+    if target:
+        _add_edit(
+            edits,
+            CandidateEdit(
+                edit_type="insert_format_after",
+                target_node_id=target,
+                reason="Add a dedicated formatting node for structured or schema-bound outputs.",
+            ),
+        )
+
+
+def _add_critique_revise_insertion_edit(edits: list[CandidateEdit], program: PromptProgram) -> None:
+    target = _last_candidate_node(program)
+    if target is None:
+        return
+    _add_edit(
+        edits,
+        CandidateEdit(
+            edit_type="insert_critique_revise_after",
+            target_node_id=target,
+            reason="Add a critique-and-revise loop to improve answer quality before finalization.",
+        ),
+    )
+
+
+def _add_targeted_rewrite(
+    edits: list[CandidateEdit],
+    program: PromptProgram,
+    *,
+    target_node_id: str | None,
+    instruction: str,
+    module_role: str | None = "instruction",
+) -> None:
+    if target_node_id is None:
+        return
+    _add_edit(
+        edits,
+        CandidateEdit(
+            edit_type="rewrite_prompt_module",
+            target_node_id=target_node_id,
+            module_role=module_role,
+            rewrite_instruction=instruction,
+            reason="Refine prompt text for the detected task family.",
+        ),
+    )
+
+
+def _add_finalize_format_edit(edits: list[CandidateEdit], instruction: str) -> None:
+    _add_edit(
+        edits,
+        CandidateEdit(
+            edit_type="change_finalize_format",
+            rewrite_instruction=instruction,
+            reason="Tighten the final output format to match task expectations.",
+        ),
+    )
+
+
+def _add_fewshot_edits(edits: list[CandidateEdit], program: PromptProgram) -> None:
+    if _has_fewshot_module(program):
+        _add_edit(
+            edits,
+            CandidateEdit(
+                edit_type="drop_fewshot_module",
+                reason="Remove few-shot guidance if it is adding noise.",
+            ),
+        )
+    else:
+        _add_edit(
+            edits,
+            CandidateEdit(
+                edit_type="add_fewshot_module",
+                reason="Add a few-shot module to ground the model on representative examples.",
+            ),
+        )
+
+
+def _has_fewshot_module(program: PromptProgram) -> bool:
+    return any(module.role == "fewshot" for node in program.nodes for module in node.prompt_modules)
+
+
+def _first_node_of_type(program: PromptProgram, node_type: NodeType) -> str | None:
+    for node in program.nodes:
+        if node.node_type == node_type:
+            return node.node_id
+    return None
+
+
 def _add_fewshot_module(program: PromptProgram, fewshot_examples: list[Example]) -> None:
     module = fewshot_module_from_examples(fewshot_examples)
     for node in program.nodes:
@@ -338,6 +662,13 @@ def _dedupe_edges(edges: list[ProgramEdge]) -> list[ProgramEdge]:
 def _last_answer_node(program: PromptProgram) -> str | None:
     for node in reversed(program.nodes):
         if node.node_type in {NodeType.DIRECT, NodeType.SOLVE, NodeType.FORMAT}:
+            return node.node_id
+    return None
+
+
+def _last_candidate_node(program: PromptProgram) -> str | None:
+    for node in reversed(program.nodes):
+        if node.node_type in {NodeType.DIRECT, NodeType.SOLVE}:
             return node.node_id
     return None
 

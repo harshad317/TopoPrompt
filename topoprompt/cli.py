@@ -8,6 +8,7 @@ from topoprompt.backends.llm_client import FakeBackend
 from topoprompt.backends.openai_backend import OpenAIBackend
 from topoprompt.compiler.search import compile_task, evaluate_program_on_examples
 from topoprompt.config import load_config
+from topoprompt.eval.benchmark_runner import BenchmarkRunner
 from topoprompt.eval.compare import compare_programs
 from topoprompt.eval.dspy_baselines import (
     compare_topoprompt_vs_dspy,
@@ -110,6 +111,21 @@ def main() -> None:
     dspy_compare_parser.add_argument("--model", default=None)
     dspy_compare_parser.add_argument("--quiet", action="store_true")
     dspy_compare_parser.add_argument("-v", "--verbose", action="count", default=0)
+
+    benchmark_family_parser = subparsers.add_parser("benchmark-family")
+    benchmark_family_parser.add_argument("--benchmark", required=True, choices=["bbh"])
+    benchmark_family_parser.add_argument("--examples-file", default=None)
+    benchmark_family_parser.add_argument("--split", default="test")
+    benchmark_family_parser.add_argument("--task-file", default=None)
+    benchmark_family_parser.add_argument("--config", default=None)
+    benchmark_family_parser.add_argument("--output-dir", required=True)
+    benchmark_family_parser.add_argument("--grouping", choices=["family", "task"], default="family")
+    benchmark_family_parser.add_argument("--groups", default=None)
+    benchmark_family_parser.add_argument("--compile-budget", type=int, default=None)
+    benchmark_family_parser.add_argument("--compare-repeats", type=int, default=1)
+    benchmark_family_parser.add_argument("--fake-backend", action="store_true")
+    benchmark_family_parser.add_argument("--quiet", action="store_true")
+    benchmark_family_parser.add_argument("-v", "--verbose", action="count", default=0)
 
     args = parser.parse_args()
     config = load_config(getattr(args, "config", None))
@@ -262,6 +278,28 @@ def main() -> None:
             bootstrap_seed=args.bootstrap_seed,
         )
         print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "benchmark-family":
+        backend = FakeBackend() if getattr(args, "fake_backend", False) else OpenAIBackend()
+        runner = BenchmarkRunner(config=config, backend=backend)
+        task_description = Path(args.task_file).read_text().strip() if args.task_file else None
+        group_names = [value.strip() for value in (args.groups or "").split(",") if value.strip()] or None
+        result = runner.compile_and_compare_by_family(
+            benchmark_name=args.benchmark,
+            examples_path=args.examples_file,
+            split=args.split,
+            task_description=task_description,
+            output_dir=args.output_dir,
+            grouping=args.grouping,
+            include_groups=group_names,
+            compare_repeats=args.compare_repeats,
+            compile_budget=args.compile_budget,
+            show_progress=not args.quiet,
+            progress_verbosity=1 + int(args.verbose or 0),
+        )
+        print(json.dumps(result, indent=2))
+        return
 
 
 def _load_task_spec(task_spec_path: str | None, examples: list, *, task_file: str | None) -> TaskSpec:

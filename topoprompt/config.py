@@ -17,6 +17,26 @@ COMPILE_BUDGET_PHASE_FIELDS = (
 )
 
 
+DEFAULT_FAMILY_OBJECTIVE_OVERRIDES = {
+    "classification": {"alpha_cost": 0.15, "beta_complexity": 0.20},
+    "extraction": {"alpha_cost": 0.08, "beta_complexity": 0.12},
+    "generation": {"alpha_cost": 0.03, "beta_complexity": 0.05},
+    "summarization": {"alpha_cost": 0.03, "beta_complexity": 0.05},
+    "code": {"alpha_cost": 0.02, "beta_complexity": 0.05},
+    "math_reasoning": {"alpha_cost": 0.05, "beta_complexity": 0.10},
+    "reasoning": {"alpha_cost": 0.04, "beta_complexity": 0.08},
+    "instruction_following": {"alpha_cost": 0.06, "beta_complexity": 0.10},
+    "factual_qa": {"alpha_cost": 0.10, "beta_complexity": 0.15},
+}
+
+
+def _default_family_objective_overrides() -> dict[str, dict[str, float]]:
+    return {
+        family: dict(weights)
+        for family, weights in DEFAULT_FAMILY_OBJECTIVE_OVERRIDES.items()
+    }
+
+
 class ModelConfig(BaseModel):
     name: str = "gpt-4.1-mini"
     repair_model: str | None = None
@@ -108,6 +128,7 @@ class ObjectiveConfig(BaseModel):
     beta_complexity: float = 0.10
     gamma_parse_failure: float = 0.20
     delta_partial_coverage: float = 0.25
+    family_overrides: dict[str, dict[str, float]] = Field(default_factory=_default_family_objective_overrides)
     epsilon_mode: str = "variance_adaptive"
     epsilon_floor: float = 0.01
     epsilon_z: float = 1.0
