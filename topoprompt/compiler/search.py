@@ -227,6 +227,9 @@ def compile_task(
     beam = _select_diverse_beam(seed_evals, width=config.compile.beam_width, min_families=config.compile.min_structural_families)
     beam_family_count_by_round = [len({candidate.family_signature for candidate in beam})] if beam else [0]
     best_beam_score = max((candidate.score for candidate in beam), default=0.0)
+    # Track the single best candidate seen at any point in the search so it
+    # can be re-injected into the beam if a later round displaces it.
+    all_time_best: CandidateEvaluation | None = max(beam, key=lambda c: (c.score, -c.complexity), default=None)
     stale_rounds = 0
 
     for round_index in range(1, config.compile.max_rounds + 1):
@@ -247,7 +250,12 @@ def compile_task(
             feedback_edit = _consume_feedback_rewrite_edit(parent)
             if feedback_edit is not None:
                 edits.append(feedback_edit)
-            edits.extend(generate_heuristic_edits(program=parent.program, analysis=analysis, config=config))
+            edits.extend(generate_heuristic_edits(
+                program=parent.program,
+                analysis=analysis,
+                config=config,
+                incumbent_score=parent.score,
+            ))
             if config.compile.llm_edit_proposals_enabled:
                 edits.extend(
                     _llm_guided_edit_proposals(
@@ -306,11 +314,23 @@ def compile_task(
             )
             archive_records.append(_archive_record(candidate, round_index=round_index))
 
-        beam = _select_diverse_beam(scored, width=config.compile.beam_width, min_families=config.compile.min_structural_families)
+        # Build the new beam from this round's candidates, but re-inject the
+        # all-time best so a great program from an earlier round is never lost
+        # to beam replacement by a weaker cohort.
+        beam_pool = list(scored)
+        if all_time_best is not None and not any(
+            c.topology_fingerprint == all_time_best.topology_fingerprint for c in beam_pool
+        ):
+            beam_pool.append(all_time_best)
+        beam = _select_diverse_beam(beam_pool, width=config.compile.beam_width, min_families=config.compile.min_structural_families)
         beam_family_count_by_round.append(len({candidate.family_signature for candidate in beam}))
         if not beam:
             reporter.log(f"Round {round_index}: beam collapsed to empty; stopping.")
             break
+        # Update all-time best with the strongest candidate from this round.
+        round_best = max(beam, key=lambda c: (c.score, -c.complexity))
+        if all_time_best is None or (round_best.score, -round_best.complexity) > (all_time_best.score, -all_time_best.complexity):
+            all_time_best = round_best
 
         leader = beam[0]
         feedback_edit = _synthesize_failure_grounded_rewrite_edit(
@@ -1128,7 +1148,9 @@ def _confirm_candidates(
     reporter: CompileProgressReporter | None = None,
 ) -> list[CandidateEvaluation]:
     confirmed: list[CandidateEvaluation] = []
-    ranked_candidates = sorted(candidates, key=lambda item: item.search_score, reverse=True)
+    # Rank by raw task score so the best-performing programs get confirmation
+    # budget first, regardless of complexity penalties in search_score.
+    ranked_candidates = sorted(candidates, key=lambda item: (item.score, item.search_score), reverse=True)
     for candidate in (reporter.track(
         ranked_candidates,
         desc="Confirmation",
@@ -1319,7 +1341,10 @@ def _select_final_selection_pool(
 
 
 def _select_diverse_beam(candidates: list[CandidateEvaluation], *, width: int, min_families: int) -> list[CandidateEvaluation]:
-    ranked = sorted(candidates, key=lambda item: (item.search_score, item.score), reverse=True)
+    # Rank by raw task performance first; search_score (cost/complexity penalty)
+    # is a tiebreaker only.  This prevents a structurally leaner but weaker
+    # program from displacing a better-performing one in the beam.
+    ranked = sorted(candidates, key=lambda item: (item.score, item.search_score), reverse=True)
     if not ranked:
         return []
     beam: list[CandidateEvaluation] = []

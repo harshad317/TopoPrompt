@@ -6,11 +6,29 @@ from topoprompt.ir import clone_program, outgoing_edges
 from topoprompt.schemas import CandidateEdit, Example, NodeType, ProgramEdge, PromptModule, PromptProgram, RouteSpec, TaskAnalysis
 
 
+_DESTRUCTIVE_STRUCTURAL_EDIT_TYPES: frozenset[str] = frozenset({
+    "replace_node_type",
+    "split_with_route",
+    "remove_route",
+    "swap_branch_target",
+    "add_node",
+    "delete_node",
+    "insert_plan_before",
+    "change_finalize_format",
+})
+
+# Programs scoring at or above this threshold are considered high-performing.
+# Destructive structural edits are suppressed to avoid mutating them away from
+# their optimum — only conservative edits (fewshot, rewrite, verify) are allowed.
+_HIGH_SCORE_CONSERVATIVE_THRESHOLD = 0.85
+
+
 def generate_heuristic_edits(
     *,
     program: PromptProgram,
     analysis: TaskAnalysis,
     config: TopoPromptConfig,
+    incumbent_score: float = 0.0,
 ) -> list[CandidateEdit]:
     _reset_edit_dedupe()
     family = analysis.task_family or "other"
@@ -129,6 +147,13 @@ def generate_heuristic_edits(
         _add_finalize_format_edit(edits, "Return only the final answer.")
         _add_route_tuning_edits(edits, program)
         _add_fewshot_edits(edits, program)
+
+    # When the parent program is already high-scoring, suppress destructive
+    # structural edits that are likely to mutate it away from its optimum.
+    # Conservative edits (fewshot tuning, prompt rewrites, verify insertion)
+    # are still allowed — they tend to refine rather than restructure.
+    if incumbent_score >= _HIGH_SCORE_CONSERVATIVE_THRESHOLD:
+        edits = [e for e in edits if e.edit_type not in _DESTRUCTIVE_STRUCTURAL_EDIT_TYPES]
 
     return edits[: config.compile.max_candidates_per_parent]
 
