@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from io import StringIO
 from pathlib import Path
 
+from rich.console import Console
+
+from topoprompt.backends.llm_client import FakeBackend
 from topoprompt.compiler.search import (
     _budgeted_stage_example_cap,
+    _synthesize_failure_grounded_rewrite_edit,
     _select_affordable_confirmation_candidates,
     _select_final_candidate,
     _select_final_selection_pool,
@@ -17,7 +22,11 @@ from topoprompt.config import TopoPromptConfig
 from topoprompt.compiler.objective import search_score
 from topoprompt.eval.budget import BudgetLedger
 from topoprompt.eval.metrics import numeric_metric
-from topoprompt.schemas import CandidateEvaluation, Example, PromptProgram, TaskAnalysis
+from topoprompt.ir import family_signature
+from topoprompt.progress import CompileProgressReporter
+from topoprompt.schemas import CandidateEvaluation, Example, ProgramExecutionTrace, PromptProgram, TaskAnalysis
+from topoprompt.transfer.features import extract_compile_winner_record, extract_transfer_features
+from topoprompt.transfer.store import TraceStore
 
 
 def test_compile_task_runs_end_to_end(fake_backend, small_config, gsm8k_examples, tmp_path):
@@ -52,6 +61,32 @@ def test_compile_budget_override_rebalances_phase_budgets(fake_backend, gsm8k_ex
 
     assert artifact.metrics.planned_budget_calls == 48
     assert sum(phase.planned_calls for phase in artifact.metrics.planned_budget_by_phase) == 48
+
+
+def test_compile_task_logs_embedding_status(gsm8k_examples, small_config, tmp_path):
+    buffer = StringIO()
+    reporter = CompileProgressReporter(
+        enabled=True,
+        verbosity=1,
+        console=Console(file=buffer, force_terminal=False, color_system=None),
+    )
+    semantic_backend = FakeBackend(
+        embed_handler=lambda _text, _model: [0.1, 0.2, 0.3],
+        embeddings_are_real=True,
+    )
+
+    compile_task(
+        task_description="Answer simple arithmetic questions accurately.",
+        examples=gsm8k_examples,
+        metric="gsm8k",
+        backend=semantic_backend,
+        config=small_config,
+        output_dir=tmp_path / "embedding_status_run",
+        task_id="gsm8k_embedding_status",
+        progress_reporter=reporter,
+    )
+
+    assert "Task embedding: real (3d)" in buffer.getvalue()
 
 
 def test_resolve_metric_canonicalizes_benchmark_alias():
@@ -457,3 +492,287 @@ def test_search_score_penalizes_partial_coverage():
     )
 
     assert partial_score < full_score
+
+
+def test_search_score_uses_family_conditioned_objective_weights():
+    config = TopoPromptConfig()
+
+    classification_score = search_score(
+        perf=0.75,
+        mean_invocations=3.0,
+        complexity=0.20,
+        parse_failure_rate=0.0,
+        coverage_ratio=1.0,
+        objective_config=config.objective,
+        program_config=config.program,
+        task_family="classification",
+    )
+    math_score = search_score(
+        perf=0.75,
+        mean_invocations=3.0,
+        complexity=0.20,
+        parse_failure_rate=0.0,
+        coverage_ratio=1.0,
+        objective_config=config.objective,
+        program_config=config.program,
+        task_family="math_reasoning",
+    )
+    code_score = search_score(
+        perf=0.75,
+        mean_invocations=3.0,
+        complexity=0.20,
+        parse_failure_rate=0.0,
+        coverage_ratio=1.0,
+        objective_config=config.objective,
+        program_config=config.program,
+        task_family="code",
+    )
+
+    assert classification_score < math_score < code_score
+
+
+def test_failure_grounded_rewrite_uses_failed_examples_in_prompt(small_config, simple_task_spec):
+    analysis = TaskAnalysis(task_family="instruction_following", output_format="short_answer")
+    program = instantiate_seed_program(task_spec=simple_task_spec, analysis=analysis, template_name="direct_finalize")
+    assert program is not None
+
+    candidate = CandidateEvaluation(
+        program=program,
+        topology_fingerprint="failure-grounded",
+        family_signature="direct",
+        stage="narrowing",
+        score=0.5,
+        search_score=0.5,
+        mean_invocations=1.0,
+        mean_tokens=50.0,
+        complexity=0.08,
+        traces=[
+            ProgramExecutionTrace(
+                example_id="fail_1",
+                program_id=program.program_id,
+                node_traces=[],
+                final_output="London",
+                correctness=0.0,
+            ),
+            ProgramExecutionTrace(
+                example_id="pass_1",
+                program_id=program.program_id,
+                node_traces=[],
+                final_output="Tokyo",
+                correctness=1.0,
+            ),
+        ],
+    )
+    examples = [
+        Example(example_id="fail_1", input={"question": "What is the capital of France?"}, target="Paris"),
+        Example(example_id="pass_1", input={"question": "What is the capital of Japan?"}, target="Tokyo"),
+    ]
+    captured_prompt: dict[str, str] = {}
+
+    def structured_handler(system_prompt: str, user_prompt: str, schema: dict[str, object]) -> dict[str, str]:
+        captured_prompt["user_prompt"] = user_prompt
+        return {
+            "target_node_id": "direct_1",
+            "module_role": "instruction",
+            "rewrite_instruction": "Answer the question exactly and match the expected factual answer.",
+            "reason": "The model confused the target fact on failed examples.",
+        }
+
+    backend = FakeBackend(structured_handler=structured_handler)
+    budget = BudgetLedger.from_compile_config(small_config.compile)
+
+    edit = _synthesize_failure_grounded_rewrite_edit(
+        parent=candidate,
+        analysis=analysis,
+        examples=examples,
+        backend=backend,
+        config=small_config,
+        budget=budget,
+    )
+
+    assert edit is not None
+    assert edit.edit_type == "rewrite_prompt_module"
+    assert edit.target_node_id == "direct_1"
+    assert "capital of France" in captured_prompt["user_prompt"]
+    assert '"expected_output": "Paris"' in captured_prompt["user_prompt"]
+    assert '"observed_output": "London"' in captured_prompt["user_prompt"]
+
+
+def test_extract_transfer_features_records_real_embedding_when_provided(simple_task_spec):
+    analysis = TaskAnalysis(task_family="reasoning", initial_seed_templates=["direct_finalize"])
+    program = instantiate_seed_program(task_spec=simple_task_spec, analysis=analysis, template_name="direct_finalize")
+    assert program is not None
+
+    features = extract_transfer_features(
+        task_spec=simple_task_spec,
+        program=program,
+        metric_name="numeric",
+        task_embedding=[0.25, 0.75],
+        task_embedding_is_real=True,
+    )
+
+    assert features["task_features"]["task_embedding"] == [0.25, 0.75]
+    assert features["task_features"]["task_embedding_is_real"] is True
+
+
+def test_trace_store_top_warm_starts_prefers_structural_overlap_across_families(simple_task_spec):
+    solve_verify_analysis = TaskAnalysis(
+        task_family="code",
+        needs_verification=True,
+        initial_seed_templates=["solve_verify_finalize"],
+    )
+    solve_verify_program = instantiate_seed_program(
+        task_spec=simple_task_spec,
+        analysis=solve_verify_analysis,
+        template_name="solve_verify_finalize",
+    )
+    direct_program = instantiate_seed_program(
+        task_spec=simple_task_spec,
+        analysis=TaskAnalysis(task_family="code", initial_seed_templates=["direct_finalize"]),
+        template_name="direct_finalize",
+    )
+    assert solve_verify_program is not None and direct_program is not None
+
+    query_signature = family_signature(solve_verify_program)
+    store = TraceStore()
+    store.append(
+        {
+            "record_type": "compile_winner",
+            "task_family": "classification",
+            "metric_name": "numeric",
+            "family_signature": query_signature,
+            "winning_topology_fingerprint": "cross_family_structural_match",
+            "winning_score": 0.90,
+            "program": solve_verify_program.model_dump(mode="json"),
+        }
+    )
+    store.append(
+        {
+            "record_type": "compile_winner",
+            "task_family": "code",
+            "metric_name": "exact_match",
+            "family_signature": family_signature(direct_program),
+            "winning_topology_fingerprint": "same_family_weaker_shape",
+            "winning_score": 0.85,
+            "program": direct_program.model_dump(mode="json"),
+        }
+    )
+
+    results = store.top_warm_starts(
+        task_family="code",
+        metric_name="numeric",
+        family_signature=query_signature,
+        limit=2,
+    )
+
+    assert [record["winning_topology_fingerprint"] for record in results] == [
+        "cross_family_structural_match",
+        "same_family_weaker_shape",
+    ]
+    assert results[0]["warm_start_similarity_score"] == 3
+    assert results[1]["warm_start_similarity_score"] == 3
+    assert results[0]["warm_start_rank_score"] > results[1]["warm_start_rank_score"]
+
+
+def test_trace_store_top_warm_starts_uses_embedding_similarity_to_break_structural_ties(simple_task_spec):
+    store = TraceStore()
+    shared_signature = "solve-verify-finalize|routes=0|fanout=0|verify=1|decompose=0"
+    for fingerprint, embedding, score in [
+        ("semantic_match", [1.0, 0.0], 0.80),
+        ("semantic_mismatch", [0.0, 1.0], 0.80),
+    ]:
+        store.append(
+            {
+                "record_type": "compile_winner",
+                "task_family": "code",
+                "metric_name": "numeric",
+                "family_signature": shared_signature,
+                "winning_topology_fingerprint": fingerprint,
+                "winning_score": score,
+                "task_features": {
+                    "task_embedding": embedding,
+                    "task_embedding_is_real": True,
+                },
+                "program": {},
+            }
+        )
+
+    results = store.top_warm_starts(
+        task_family="code",
+        metric_name="numeric",
+        family_signature=shared_signature,
+        task_embedding=[1.0, 0.0],
+        task_embedding_is_real=True,
+        limit=2,
+    )
+
+    assert [record["winning_topology_fingerprint"] for record in results] == [
+        "semantic_match",
+        "semantic_mismatch",
+    ]
+    assert results[0]["warm_start_similarity_score"] > results[1]["warm_start_similarity_score"]
+
+
+def test_extract_compile_winner_record_persists_task_description(simple_task_spec):
+    analysis = TaskAnalysis(task_family="reasoning", initial_seed_templates=["direct_finalize"])
+    program = instantiate_seed_program(task_spec=simple_task_spec, analysis=analysis, template_name="direct_finalize")
+    assert program is not None
+
+    candidate = CandidateEvaluation(
+        program=program,
+        topology_fingerprint="winner",
+        family_signature="direct-finalize",
+        stage="confirmation",
+        score=0.9,
+        search_score=0.88,
+        mean_invocations=1.0,
+        mean_tokens=20.0,
+        complexity=0.05,
+    )
+
+    record = extract_compile_winner_record(
+        task_spec=simple_task_spec,
+        candidate=candidate,
+        metric_name="numeric",
+        task_embedding=[0.1, 0.2],
+        task_embedding_is_real=True,
+    )
+
+    assert record["task_description"] == simple_task_spec.description
+
+
+def test_compile_task_loads_transfer_warm_start_seeds(fake_backend, small_config, gsm8k_examples, simple_task_spec, tmp_path: Path):
+    analysis = TaskAnalysis(task_family="math_reasoning", initial_seed_templates=["direct_self_consistency_x3"])
+    warm_start_program = instantiate_seed_program(
+        task_spec=simple_task_spec,
+        analysis=analysis,
+        template_name="direct_self_consistency_x3",
+    )
+    assert warm_start_program is not None
+
+    store = TraceStore(tmp_path / "transfer_trace_store.jsonl")
+    store.append(
+        {
+            "record_type": "compile_winner",
+            "task_family": "math_reasoning",
+            "metric_name": "numeric",
+            "winning_topology_fingerprint": "warm-self-consistency",
+            "winning_score": 0.91,
+            "program": warm_start_program.model_dump(mode="json"),
+        }
+    )
+    store.flush()
+
+    artifact = compile_task(
+        task_description="Answer simple arithmetic questions accurately.",
+        examples=gsm8k_examples,
+        metric="gsm8k",
+        backend=fake_backend,
+        config=small_config,
+        output_dir=tmp_path / "run",
+        task_id="transfer_warm_start",
+    )
+
+    assert any(program.program_id.startswith("warm_start_") for program in artifact.seed_programs)
+    assert any(program.metadata.get("warm_start_source") == "transfer_trace_store" for program in artifact.seed_programs)
+    assert any(program.metadata.get("warm_start_rank_score", 0.0) > 0.0 for program in artifact.seed_programs)

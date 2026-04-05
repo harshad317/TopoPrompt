@@ -62,3 +62,12 @@ class OpenAIBackend(LLMBackend):
             max_output_tokens=max_output_tokens,
         )
 
+    def embed_text(self, text: str, *, model: str) -> list[float]:
+        response = self.client.embeddings.create(
+            input=text,
+            model=model,
+        )
+        return list(response.data[0].embedding)
+
+    def embeddings_are_real(self) -> bool:
+        return True

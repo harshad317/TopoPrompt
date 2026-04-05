@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from topoprompt.backends.llm_client import FakeBackend
 from topoprompt.compiler.analyzer import analyze_task, heuristic_task_analysis
+from topoprompt.compiler.task_priors import _recommend_seed_templates
 from topoprompt.schemas import Example, TaskSpec
 
 
@@ -67,6 +68,21 @@ def test_heuristic_task_analysis_prefers_classification_when_targets_include_rat
     assert analysis.task_family == "classification"
     assert analysis.output_format == "label"
     assert analysis.initial_seed_templates == ["direct_finalize"]
+
+
+def test_classification_seed_recommendations_include_self_consistency_for_reasoning():
+    seeds = _recommend_seed_templates(
+        task_family="classification",
+        output_format="label",
+        needs_reasoning=True,
+        needs_verification=False,
+        needs_decomposition=False,
+        input_heterogeneity="high",
+    )
+
+    assert "route_direct_or_solve_finalize" in seeds
+    assert "solve_verify_finalize" in seeds
+    assert "direct_self_consistency_x3" in seeds
 
 
 def test_fake_backend_analysis_uses_broader_code_priors(small_config):

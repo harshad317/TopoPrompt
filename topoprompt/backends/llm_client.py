@@ -67,6 +67,9 @@ class LLMBackend(ABC):
     def embed_text(self, text: str, *, model: str) -> list[float]:
         return [float((sum(ord(ch) for ch in text) % 1000) / 1000.0)]
 
+    def embeddings_are_real(self) -> bool:
+        return False
+
 
 class FakeBackend(LLMBackend):
     def __init__(
@@ -74,9 +77,13 @@ class FakeBackend(LLMBackend):
         *,
         structured_handler: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None = None,
         text_handler: Callable[[str, str], str] | None = None,
+        embed_handler: Callable[[str, str], list[float]] | None = None,
+        embeddings_are_real: bool = False,
     ) -> None:
         self.structured_handler = structured_handler
         self.text_handler = text_handler
+        self.embed_handler = embed_handler
+        self._embeddings_are_real = embeddings_are_real
         self.request_counter = 0
 
     def generate_text(
@@ -137,8 +144,13 @@ class FakeBackend(LLMBackend):
         )
 
     def embed_text(self, text: str, *, model: str) -> list[float]:
+        if self.embed_handler is not None:
+            return self.embed_handler(text, model)
         digest = sum((index + 1) * ord(ch) for index, ch in enumerate(text[:64]))
         return [float((digest + offset) % 997) / 997.0 for offset in range(8)]
+
+    def embeddings_are_real(self) -> bool:
+        return self._embeddings_are_real
 
     def _default_text(self, system_prompt: str, user_prompt: str) -> str:
         return json.dumps(self._default_structured(system_prompt, user_prompt, {"type": "object", "properties": {}}))

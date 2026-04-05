@@ -19,7 +19,7 @@ from topoprompt.config import TopoPromptConfig, load_config
 from topoprompt.eval.budget import BudgetLedger
 from topoprompt.eval.datasets import DatasetPartitions, partition_examples
 from topoprompt.eval.metrics import MetricFn, canonical_metric_name, metric_for_name
-from topoprompt.ir import family_signature, topology_fingerprint
+from topoprompt.ir import clone_program, family_signature, topology_fingerprint
 from topoprompt.progress import CompileProgressReporter
 from topoprompt.runtime.executor import BudgetExhausted, ProgramExecutor
 from topoprompt.runtime.trace import aggregate_route_metrics
@@ -35,7 +35,7 @@ from topoprompt.schemas import (
     TaskAnalysis,
     TaskSpec,
 )
-from topoprompt.transfer.features import extract_transfer_features
+from topoprompt.transfer.features import extract_compile_winner_record, extract_transfer_features
 from topoprompt.transfer.store import TraceStore
 
 
@@ -85,8 +85,14 @@ def compile_task(
         fewshot_examples=fewshot_examples,
     )
     task_spec = _infer_task_spec(task_description=task_description, examples=examples, task_id=task_id)
+    task_embedding, task_embedding_is_real = _compute_task_embedding(
+        task_spec=task_spec,
+        backend=backend,
+        config=config,
+        reporter=reporter,
+    )
     budget = BudgetLedger.from_compile_config(config.compile)
-    trace_store = TraceStore(Path(output_dir) / "transfer_trace_store.jsonl" if output_dir else None)
+    trace_store = TraceStore(_trace_store_path(output_dir))
     reporter.rule(f"TopoPrompt Compile: {task_spec.task_id}")
     reporter.log(
         (
@@ -94,6 +100,14 @@ def compile_task(
             f"fewshot={len(partitions.fewshot_examples)} "
             f"search={len(partitions.search_examples)} "
             f"validation={len(partitions.validation_examples)}"
+        ),
+        style="cyan",
+    )
+    reporter.log(
+        _task_embedding_status_message(
+            embedding_model=config.model.embedding_model,
+            task_embedding=task_embedding,
+            task_embedding_is_real=task_embedding_is_real,
         ),
         style="cyan",
     )
@@ -117,6 +131,17 @@ def compile_task(
         include_direct_baseline=config.compile.always_include_direct_seed,
         seed_names=seed_names,
     )
+    warm_start_programs = _load_transfer_warm_start_seeds(
+        trace_store=trace_store,
+        task_spec=task_spec,
+        metric_name=metric_name,
+        family_signature=_warm_start_query_signature(seed_programs),
+        task_embedding=task_embedding,
+        task_embedding_is_real=task_embedding_is_real,
+        config=config,
+        reporter=reporter,
+    )
+    seed_programs = _prioritize_seed_programs(seed_programs=seed_programs, warm_start_programs=warm_start_programs)
     seed_programs = [program for program in seed_programs if _validate_candidate(program, config)]
     reporter.log(f"Valid instantiated seeds: {len(seed_programs)}")
 
@@ -158,6 +183,7 @@ def compile_task(
             include_direct_baseline=config.compile.always_include_direct_seed,
             seed_names=SEED_LIBRARY,
         )
+        seed_programs = _prioritize_seed_programs(seed_programs=seed_programs, warm_start_programs=warm_start_programs)
         seed_programs = [program for program in seed_programs if _validate_candidate(program, config)]
         seed_evals = []
         for program in reporter.track(
@@ -206,7 +232,11 @@ def compile_task(
             leave=False,
             level=1,
         ):
-            edits = generate_heuristic_edits(program=parent.program, analysis=analysis, config=config)
+            edits = []
+            feedback_edit = _consume_feedback_rewrite_edit(parent)
+            if feedback_edit is not None:
+                edits.append(feedback_edit)
+            edits.extend(generate_heuristic_edits(program=parent.program, analysis=analysis, config=config))
             if config.compile.llm_edit_proposals_enabled:
                 edits.extend(
                     _llm_guided_edit_proposals(
@@ -253,7 +283,16 @@ def compile_task(
 
         for candidate in scored:
             compile_traces.extend(candidate.traces)
-            trace_store.append(extract_transfer_features(task_spec=task_spec, program=candidate.program, candidate=candidate))
+            trace_store.append(
+                extract_transfer_features(
+                    task_spec=task_spec,
+                    program=candidate.program,
+                    candidate=candidate,
+                    metric_name=metric_name,
+                    task_embedding=task_embedding,
+                    task_embedding_is_real=task_embedding_is_real,
+                )
+            )
             archive_records.append(_archive_record(candidate, round_index=round_index))
 
         beam = _select_diverse_beam(scored, width=config.compile.beam_width, min_families=config.compile.min_structural_families)
@@ -263,6 +302,21 @@ def compile_task(
             break
 
         leader = beam[0]
+        feedback_edit = _synthesize_failure_grounded_rewrite_edit(
+            parent=leader,
+            analysis=analysis,
+            examples=partitions.search_examples,
+            backend=backend,
+            config=config,
+            budget=budget,
+        )
+        if feedback_edit is not None:
+            leader.metadata = dict(leader.metadata)
+            leader.metadata["feedback_rewrite_edit"] = feedback_edit.model_dump(mode="json")
+            reporter.log(
+                f"Round {round_index}: queued failure-grounded rewrite for {leader.program.program_id}.",
+                level=1,
+            )
         reporter.log_candidate(leader, prefix=f"Round {round_index} leader ", level=1)
 
         current_best = max(candidate.search_score for candidate in beam)
@@ -364,6 +418,16 @@ def compile_task(
         metrics=metrics,
         config=config.model_dump(mode="json"),
         output_dir=str(output_dir) if output_dir else None,
+    )
+    trace_store.append(
+        extract_compile_winner_record(
+            task_spec=task_spec,
+            candidate=best_candidate,
+            metric_name=metric_name,
+            output_dir=output_dir,
+            task_embedding=task_embedding,
+            task_embedding_is_real=task_embedding_is_real,
+        )
     )
     if output_dir is not None:
         write_compile_artifact(artifact, output_dir)
@@ -487,6 +551,272 @@ def _run_analysis(
     return analysis
 
 
+def _trace_store_path(output_dir: str | Path | None) -> Path | None:
+    if output_dir is None:
+        return None
+    output_path = Path(output_dir)
+    return output_path.parent / "transfer_trace_store.jsonl"
+
+
+def _compute_task_embedding(
+    *,
+    task_spec: TaskSpec,
+    backend: LLMBackend,
+    config: TopoPromptConfig,
+    reporter: CompileProgressReporter | None = None,
+) -> tuple[list[float], bool]:
+    embedding_model = config.model.embedding_model
+    if not embedding_model:
+        return [], False
+    try:
+        task_embedding = backend.embed_text(task_spec.description, model=embedding_model)
+    except Exception:
+        if reporter is not None:
+            reporter.log("Task embedding lookup failed; continuing without semantic transfer features.", level=1)
+        return [], False
+    if not task_embedding or not backend.embeddings_are_real():
+        return [], False
+    return list(task_embedding), True
+
+
+def _task_embedding_status_message(
+    *,
+    embedding_model: str | None,
+    task_embedding: list[float],
+    task_embedding_is_real: bool,
+) -> str:
+    if task_embedding_is_real:
+        return f"Task embedding: real ({len(task_embedding)}d)"
+    if not embedding_model:
+        return "Task embedding: structural fallback (no embedding model configured)"
+    return "Task embedding: structural fallback (semantic embedding unavailable)"
+
+
+def _load_transfer_warm_start_seeds(
+    *,
+    trace_store: TraceStore,
+    task_spec: TaskSpec,
+    metric_name: str,
+    family_signature: str | None,
+    task_embedding: list[float],
+    task_embedding_is_real: bool,
+    config: TopoPromptConfig,
+    reporter: CompileProgressReporter | None = None,
+) -> list[PromptProgram]:
+    warm_start_records = trace_store.top_warm_starts(
+        task_family=task_spec.task_family,
+        metric_name=metric_name,
+        family_signature=family_signature,
+        task_embedding=task_embedding,
+        task_embedding_is_real=task_embedding_is_real,
+        limit=3,
+    )
+    if not warm_start_records:
+        return []
+
+    warm_start_programs: list[PromptProgram] = []
+    for index, record in enumerate(warm_start_records, start=1):
+        raw_program = record.get("program")
+        if raw_program is None:
+            continue
+        try:
+            stored_program = PromptProgram.model_validate(raw_program)
+        except Exception:
+            continue
+        warm_start = clone_program(stored_program, program_id=f"warm_start_{index}_{stored_program.program_id}")
+        warm_start.task_id = task_spec.task_id
+        warm_start.metadata = dict(warm_start.metadata)
+        warm_start.metadata.update(
+            {
+                "warm_start_source": "transfer_trace_store",
+                "warm_start_task_family": record.get("task_family"),
+                "warm_start_metric_name": record.get("metric_name"),
+                "warm_start_family_signature": record.get("family_signature"),
+                "warm_start_topology_fingerprint": record.get("winning_topology_fingerprint"),
+                "warm_start_score": record.get("winning_score"),
+                "warm_start_similarity_score": record.get("warm_start_similarity_score"),
+                "warm_start_rank_score": record.get("warm_start_rank_score"),
+            }
+        )
+        if _validate_candidate(warm_start, config):
+            warm_start_programs.append(warm_start)
+    if reporter is not None and warm_start_programs:
+        reporter.log(
+            (
+                f"Loaded {len(warm_start_programs)} warm-start seed(s) "
+                f"for family={task_spec.task_family} metric={metric_name} "
+                f"query_signature={family_signature} embedding_real={task_embedding_is_real}."
+            ),
+        )
+    return warm_start_programs
+
+
+def _warm_start_query_signature(seed_programs: list[PromptProgram]) -> str | None:
+    if not seed_programs:
+        return None
+    for program in seed_programs:
+        if program.program_id != "direct_finalize":
+            return family_signature(program)
+    return family_signature(seed_programs[0])
+
+
+def _prioritize_seed_programs(
+    *,
+    seed_programs: list[PromptProgram],
+    warm_start_programs: list[PromptProgram],
+) -> list[PromptProgram]:
+    direct_baselines = [program for program in seed_programs if program.program_id == "direct_finalize"]
+    other_seed_programs = [program for program in seed_programs if program.program_id != "direct_finalize"]
+    seen: set[str] = set()
+    prioritized: list[PromptProgram] = []
+    for program in [*direct_baselines, *warm_start_programs, *other_seed_programs]:
+        fingerprint = topology_fingerprint(program)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        prioritized.append(program)
+    return prioritized
+
+
+def _consume_feedback_rewrite_edit(candidate: CandidateEvaluation) -> CandidateEdit | None:
+    raw_edit = candidate.metadata.get("feedback_rewrite_edit")
+    if raw_edit is None:
+        return None
+    candidate.metadata = dict(candidate.metadata)
+    candidate.metadata.pop("feedback_rewrite_edit", None)
+    try:
+        payload = json.loads(raw_edit) if isinstance(raw_edit, str) else raw_edit
+        edit = CandidateEdit.model_validate(payload)
+    except Exception:
+        return None
+    return edit if edit.edit_type == "rewrite_prompt_module" else None
+
+
+def _synthesize_failure_grounded_rewrite_edit(
+    *,
+    parent: CandidateEvaluation,
+    analysis: TaskAnalysis,
+    examples: list[Example],
+    backend: LLMBackend,
+    config: TopoPromptConfig,
+    budget: BudgetLedger,
+) -> CandidateEdit | None:
+    failed_examples = _failed_examples_for_candidate(parent=parent, examples=examples, limit=5)
+    if not failed_examples:
+        return None
+    if not budget.spend("screening", 1):
+        return None
+
+    rewrite_targets = [
+        node.node_id
+        for node in parent.program.nodes
+        if node.execution_mode != "pass_through"
+    ]
+    if not rewrite_targets:
+        return None
+    default_target = _default_rewrite_target(parent.program)
+    schema = {
+        "type": "object",
+        "properties": {
+            "target_node_id": {"type": ["string", "null"]},
+            "module_role": {"type": ["string", "null"]},
+            "rewrite_instruction": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["rewrite_instruction", "reason"],
+    }
+    try:
+        response = backend.generate_structured(
+            system_prompt="You improve prompt programs by rewriting one module based on concrete failures.",
+            user_prompt=(
+                f"Task summary:\n{analysis.model_dump_json(indent=2)}\n\n"
+                f"Current program:\n{json.dumps(_program_summary(parent.program, parent), indent=2)}\n\n"
+                f"Rewrite target candidates:\n{json.dumps(rewrite_targets, indent=2)}\n\n"
+                f"Failed examples:\n{json.dumps(failed_examples, indent=2)}\n\n"
+                "Return a single rewrite_prompt_module edit that directly addresses the recurring mistakes.\n"
+                "Choose the node whose prompt text most directly controls the failure.\n"
+                "Make the rewrite instruction concrete and grounded in the failed cases, not generic."
+            ),
+            schema=schema,
+            model=config.model.name,
+            temperature=0.0,
+            max_output_tokens=config.model.max_output_tokens,
+        )
+        payload = response.structured or json.loads(response.text)
+        target_node_id = payload.get("target_node_id")
+        if target_node_id not in parent.program.node_map():
+            target_node_id = default_target
+        module_role = payload.get("module_role") or "instruction"
+        if module_role not in {"instruction", "reasoning", "verification", "format"}:
+            module_role = "instruction"
+        rewrite_instruction = str(payload.get("rewrite_instruction", "")).strip()
+        if not rewrite_instruction:
+            return None
+        return CandidateEdit(
+            edit_type="rewrite_prompt_module",
+            target_node_id=target_node_id,
+            module_role=module_role,
+            rewrite_instruction=rewrite_instruction,
+            reason=str(payload.get("reason", "Ground the rewrite in recent failures.")),
+        )
+    except Exception:
+        return None
+
+
+def _failed_examples_for_candidate(
+    *,
+    parent: CandidateEvaluation,
+    examples: list[Example],
+    limit: int,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    examples_by_id = {example.example_id: example for example in examples}
+    failed_rows: list[dict[str, Any]] = []
+    for trace in parent.traces:
+        if float(trace.correctness or 0.0) > 0.0:
+            continue
+        example = examples_by_id.get(trace.example_id)
+        if example is None:
+            continue
+        failed_rows.append(
+            {
+                "example_id": example.example_id,
+                "input": example.input,
+                "expected_output": example.target,
+                "observed_output": trace.final_output,
+            }
+        )
+        if len(failed_rows) >= limit:
+            break
+    return failed_rows
+
+
+def _default_rewrite_target(program: PromptProgram) -> str | None:
+    answerish_targets = [node.node_id for node in program.nodes if node.node_type.value in {"direct", "solve"}]
+    if answerish_targets:
+        return answerish_targets[-1]
+    for node in reversed(program.nodes):
+        if node.execution_mode != "pass_through":
+            return node.node_id
+    return None
+
+
+def _program_summary(program: PromptProgram, candidate: CandidateEvaluation | None = None) -> dict[str, Any]:
+    summary = {
+        "program_id": program.program_id,
+        "nodes": [node.node_type.value for node in program.nodes],
+        "node_ids": [node.node_id for node in program.nodes],
+        "family_signature": family_signature(program),
+    }
+    if candidate is not None:
+        summary["search_score"] = candidate.search_score
+        summary["score"] = candidate.score
+        summary["parse_failure_rate"] = candidate.parse_failure_rate
+        summary["mean_invocations"] = candidate.mean_invocations
+    return summary
+
+
 def _evaluate_candidate(
     *,
     program: PromptProgram,
@@ -582,6 +912,7 @@ def _evaluate_candidate(
             coverage_ratio=coverage_ratio,
             objective_config=config.objective,
             program_config=config.program,
+            task_family=task_spec.task_family,
         ),
         mean_invocations=mean_invocations,
         mean_tokens=mean_tokens,
@@ -1099,7 +1430,8 @@ def _llm_guided_edit_proposals(
                 "Allowed edit operators:\n"
                 "- add_node\n- delete_node\n- replace_node_type\n- insert_verify_after\n- insert_plan_before\n"
                 "- split_with_route\n- remove_route\n- swap_branch_target\n- rewrite_prompt_module\n"
-                "- add_fewshot_module\n- drop_fewshot_module\n- change_finalize_format\n\n"
+                "- add_fewshot_module\n- drop_fewshot_module\n- change_finalize_format\n"
+                "- insert_format_after\n- insert_critique_revise_after\n\n"
                 f"Hard constraints:\n- graph must remain a DAG\n- exactly one finalize node\n- max nodes: {config.program.max_nodes}\n"
                 f"- max route nodes: {config.program.max_route_nodes}\n- max branch fanout: {config.program.max_branch_fanout}\n"
             ),

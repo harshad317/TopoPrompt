@@ -6,6 +6,7 @@ from topoprompt.schemas import NodeType, ProgramEdge, PromptModule, PromptProgra
 
 SEED_LIBRARY = [
     "direct_finalize",
+    "direct_self_consistency_x3",
     "format_finalize",
     "critique_revise_finalize",
     "plan_solve_finalize",

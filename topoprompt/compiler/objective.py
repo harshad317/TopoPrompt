@@ -3,6 +3,7 @@ from __future__ import annotations
 from math import sqrt
 from statistics import mean, pstdev
 
+from topoprompt.compiler.task_priors import normalize_task_family
 from topoprompt.config import ObjectiveConfig, ProgramConfig
 from topoprompt.ir import branch_count, prompt_token_count
 from topoprompt.schemas import CandidateEvaluation, PromptProgram
@@ -26,16 +27,27 @@ def search_score(
     coverage_ratio: float,
     objective_config: ObjectiveConfig,
     program_config: ProgramConfig,
+    task_family: str | None = None,
 ) -> float:
+    weights = _resolve_objective_weights(objective_config=objective_config, task_family=task_family)
     cost_norm = min(mean_invocations / max(program_config.max_nodes, 1), 1.0)
     coverage_penalty = objective_config.delta_partial_coverage * max(1.0 - coverage_ratio, 0.0)
     return (
         perf
-        - objective_config.alpha_cost * cost_norm
-        - objective_config.beta_complexity * complexity
+        - weights["alpha_cost"] * cost_norm
+        - weights["beta_complexity"] * complexity
         - objective_config.gamma_parse_failure * parse_failure_rate
         - coverage_penalty
     )
+
+
+def _resolve_objective_weights(*, objective_config: ObjectiveConfig, task_family: str | None) -> dict[str, float]:
+    normalized_family = normalize_task_family(task_family)
+    overrides = objective_config.family_overrides.get(normalized_family, {})
+    return {
+        "alpha_cost": float(overrides.get("alpha_cost", objective_config.alpha_cost)),
+        "beta_complexity": float(overrides.get("beta_complexity", objective_config.beta_complexity)),
+    }
 
 
 def compute_variance_adaptive_epsilon(candidates: list[CandidateEvaluation], objective_config: ObjectiveConfig) -> float:

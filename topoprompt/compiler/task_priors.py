@@ -414,6 +414,7 @@ def _recommend_seed_templates(
                 seeds.append("route_direct_or_solve_finalize")
             if needs_reasoning:
                 seeds.append("solve_verify_finalize")
+                seeds.append("direct_self_consistency_x3")
         case "extraction":
             seeds.append("format_finalize")
             if input_heterogeneity == "high" and needs_reasoning:
