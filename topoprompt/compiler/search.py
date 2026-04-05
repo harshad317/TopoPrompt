@@ -226,7 +226,7 @@ def compile_task(
     compile_traces = [trace for candidate in seed_evals for trace in candidate.traces]
     beam = _select_diverse_beam(seed_evals, width=config.compile.beam_width, min_families=config.compile.min_structural_families)
     beam_family_count_by_round = [len({candidate.family_signature for candidate in beam})] if beam else [0]
-    best_beam_score = max((candidate.search_score for candidate in beam), default=0.0)
+    best_beam_score = max((candidate.score for candidate in beam), default=0.0)
     stale_rounds = 0
 
     for round_index in range(1, config.compile.max_rounds + 1):
@@ -330,7 +330,11 @@ def compile_task(
             )
         reporter.log_candidate(leader, prefix=f"Round {round_index} leader ", level=1)
 
-        current_best = max(candidate.search_score for candidate in beam)
+        # Track raw task performance for convergence, not search_score.
+        # Using search_score conflates complexity/cost penalties with actual
+        # accuracy improvements, causing premature early stopping when a better
+        # program happens to be slightly longer or more expensive.
+        current_best = max(candidate.score for candidate in beam)
         if current_best < best_beam_score + config.compile.early_stop_min_improvement:
             stale_rounds += 1
         else:
@@ -931,9 +935,15 @@ def _evaluate_candidate(
     mean_invocations = mean(trace.total_invocations for trace in traces)
     mean_tokens = mean(trace.total_tokens for trace in traces)
     coverage_ratio = len(traces) / max(len(scoped_examples), 1)
-    parse_failure_rate = sum(trace.parse_failures for trace in traces) / max(
-        1, sum(len(trace.node_traces) for trace in traces)
+    # Only count node executions that actually involved an LLM call
+    # (invocation_cost > 0).  Pass-through nodes never parse anything, so
+    # including them in the denominator artificially deflates the failure rate
+    # and makes structurally richer programs look unfairly more reliable.
+    llm_node_count = sum(
+        sum(1 for nt in trace.node_traces if nt.invocation_cost > 0)
+        for trace in traces
     )
+    parse_failure_rate = sum(trace.parse_failures for trace in traces) / max(1, llm_node_count)
     perf = mean(scores)
     candidate = CandidateEvaluation(
         program=program,
@@ -953,6 +963,7 @@ def _evaluate_candidate(
             objective_config=config.objective,
             program_config=config.program,
             task_family=task_spec.task_family,
+            budget_examples=max_examples,
         ),
         mean_invocations=mean_invocations,
         mean_tokens=mean_tokens,

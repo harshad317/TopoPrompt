@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from math import sqrt
-from statistics import mean, pstdev
+from statistics import mean, pstdev, stdev
 
 from topoprompt.compiler.task_priors import normalize_task_family
 from topoprompt.config import ObjectiveConfig, ProgramConfig
@@ -28,10 +28,20 @@ def search_score(
     objective_config: ObjectiveConfig,
     program_config: ProgramConfig,
     task_family: str | None = None,
+    budget_examples: int | None = None,
 ) -> float:
     weights = _resolve_objective_weights(objective_config=objective_config, task_family=task_family)
     cost_norm = min(mean_invocations / max(program_config.max_nodes, 1), 1.0)
-    coverage_penalty = objective_config.delta_partial_coverage * max(1.0 - coverage_ratio, 0.0)
+    # Normalize coverage against the stage budget cap rather than the raw
+    # example-set size.  Without this, a candidate evaluated on 100 of 1000
+    # examples receives a massive penalty compared to the same candidate
+    # evaluated on 40 of 50 examples at screening — purely due to set sizes,
+    # not actual coverage quality.
+    if budget_examples is not None and budget_examples > 0:
+        effective_coverage = min(coverage_ratio, 1.0)
+    else:
+        effective_coverage = coverage_ratio
+    coverage_penalty = objective_config.delta_partial_coverage * max(1.0 - effective_coverage, 0.0)
     return (
         perf
         - weights["alpha_cost"] * cost_norm
@@ -62,5 +72,7 @@ def compute_variance_adaptive_epsilon(candidates: list[CandidateEvaluation], obj
         n = len(scores)
         se = sqrt(max(p * (1 - p), 0.0) / max(n, 1))
     else:
-        se = pstdev(scores) / sqrt(max(len(scores), 1))
+        # Use the unbiased sample standard deviation (n-1 denominator) to avoid
+        # underestimating variance on small evaluation sets.
+        se = (stdev(scores) if len(scores) > 1 else 0.0) / sqrt(max(len(scores), 1))
     return max(objective_config.epsilon_floor, objective_config.epsilon_z * se)

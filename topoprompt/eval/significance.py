@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 from pathlib import Path
-from statistics import mean, pstdev
+from statistics import mean, pstdev, stdev
 from typing import Any
 
 import orjson
@@ -32,7 +32,8 @@ def build_significance_summary(
         for row in repeat_results
     ]
     delta_values = [float(row["score_delta_a_minus_b"]) for row in repeat_summaries]
-    p_values = [float(row["mcnemar_exact_p_value"]) for row in repeat_summaries]
+    # McNemar p-values are None for continuous metrics; filter before aggregating.
+    p_values = [float(row["mcnemar_exact_p_value"]) for row in repeat_summaries if row["mcnemar_exact_p_value"] is not None]
 
     return {
         "label_a": label_a,
@@ -45,10 +46,13 @@ def build_significance_summary(
         "bootstrap_samples": bootstrap_samples,
         "score_delta_a_minus_b_mean": mean(delta_values),
         "score_delta_a_minus_b_std": _std(delta_values),
-        "mcnemar_exact_p_value_mean": mean(p_values),
-        "mcnemar_exact_p_value_min": min(p_values),
+        "mcnemar_exact_p_value_mean": mean(p_values) if p_values else None,
+        "mcnemar_exact_p_value_min": min(p_values) if p_values else None,
         "compiled_better_repeats": sum(1 for row in repeat_summaries if row["score_delta_a_minus_b"] > 0.0),
-        "significant_repeats_p_lt_0_05": sum(1 for row in repeat_summaries if row["mcnemar_exact_p_value"] < 0.05),
+        "significant_repeats_p_lt_0_05": sum(
+            1 for row in repeat_summaries
+            if row["mcnemar_exact_p_value"] is not None and row["mcnemar_exact_p_value"] < 0.05
+        ),
         "repeat_results": repeat_summaries,
     }
 
@@ -92,6 +96,16 @@ def build_repeat_significance(
     score_b = float(repeat_metrics["score_b"])
     delta_a_minus_b = score_a - score_b
 
+    # McNemar's test is only valid for binary (0/1) outcomes. For continuous
+    # metrics the test is meaningless, so we emit None rather than a misleading
+    # p-value.
+    if binary_supported:
+        mcnemar_exact_p = _mcnemar_exact_p_value(a_only=a_only, b_only=b_only)
+        mcnemar_chi_square_p = _mcnemar_chi_square_p_value(a_only=a_only, b_only=b_only)
+    else:
+        mcnemar_exact_p = None
+        mcnemar_chi_square_p = None
+
     return {
         "repeat_index": int(repeat_metrics["repeat_index"]),
         "score_a": score_a,
@@ -104,8 +118,8 @@ def build_repeat_significance(
         "both_zero_count": both_zero,
         "discordant_pair_count": discordant,
         "binary_accuracy_supported": binary_supported,
-        "mcnemar_exact_p_value": _mcnemar_exact_p_value(a_only=a_only, b_only=b_only),
-        "mcnemar_chi_square_p_value": _mcnemar_chi_square_p_value(a_only=a_only, b_only=b_only),
+        "mcnemar_exact_p_value": mcnemar_exact_p,
+        "mcnemar_chi_square_p_value": mcnemar_chi_square_p,
         "bootstrap_delta_a_minus_b_ci_low": ci_low,
         "bootstrap_delta_a_minus_b_ci_high": ci_high,
         "bootstrap_probability_a_beats_b": probability_a_beats_b,
@@ -155,8 +169,8 @@ def render_significance_summary(summary: dict[str, Any]) -> str:
         f"- Sample count: `{summary['sample_count']}`",
         f"- Repeats: `{summary['repeats']}`",
         f"- Delta (A - B) mean/std: `{summary['score_delta_a_minus_b_mean']:.4f}` / `{summary['score_delta_a_minus_b_std']:.4f}`",
-        f"- McNemar exact p-value mean: `{summary['mcnemar_exact_p_value_mean']:.6f}`",
-        f"- McNemar exact p-value min: `{summary['mcnemar_exact_p_value_min']:.6f}`",
+        f"- McNemar exact p-value mean: `{summary['mcnemar_exact_p_value_mean']:.6f}`" if summary["mcnemar_exact_p_value_mean"] is not None else "- McNemar exact p-value mean: `n/a (continuous metric)`",
+        f"- McNemar exact p-value min: `{summary['mcnemar_exact_p_value_min']:.6f}`" if summary["mcnemar_exact_p_value_min"] is not None else "- McNemar exact p-value min: `n/a (continuous metric)`",
         f"- Significant repeats (p < 0.05): `{summary['significant_repeats_p_lt_0_05']}`",
         "",
         "## Per Repeat",
@@ -174,7 +188,7 @@ def render_significance_summary(summary: dict[str, Any]) -> str:
                 f"- Repeat {row['repeat_index']}: "
                 f"delta={row['score_delta_a_minus_b']:.4f}, "
                 f"discordant={row['discordant_pair_count']}, "
-                f"p_exact={row['mcnemar_exact_p_value']:.6f}, "
+                f"p_exact={row['mcnemar_exact_p_value']:.6f}, " if row["mcnemar_exact_p_value"] is not None else "p_exact=n/a, "
                 f"bootstrap_ci={ci_fragment}"
             )
         )
@@ -209,14 +223,27 @@ def _bootstrap_accuracy_delta_ci(
     bootstrap_samples: int,
     bootstrap_seed: int,
 ) -> tuple[float, float, float]:
-    deltas = ([1] * a_only) + ([-1] * b_only) + ([0] * ties)
+    # Reconstruct per-example (score_a, score_b) pairs from concordance counts.
+    # a_only  → A correct, B wrong  → (1, 0)
+    # b_only  → B correct, A wrong  → (0, 1)
+    # ties (both_positive + both_zero) split into equal halves:
+    #   both_positive → (1, 1),  both_zero → (0, 0)
+    # We don't know the exact split of `ties` here so we treat all as (0, 0)
+    # for a conservative estimate (delta = 0 for ties either way).
+    pairs: list[tuple[int, int]] = (
+        [(1, 0)] * a_only
+        + [(0, 1)] * b_only
+        + [(0, 0)] * ties
+    )
     rng = random.Random(bootstrap_seed)
+    n = len(pairs)
     estimates: list[float] = []
     positive = 0
     for _ in range(bootstrap_samples):
-        estimate = sum(deltas[rng.randrange(sample_count)] for _ in range(sample_count)) / sample_count
-        estimates.append(estimate)
-        if estimate > 0:
+        sample = [pairs[rng.randrange(n)] for _ in range(n)]
+        delta = sum(pa - pb for pa, pb in sample) / n
+        estimates.append(delta)
+        if delta > 0:
             positive += 1
     estimates.sort()
     lower_q = (1.0 - confidence_level) / 2.0
@@ -256,7 +283,7 @@ def _logsumexp(values: list[float]) -> float:
 def _std(values: list[float]) -> float:
     if len(values) <= 1:
         return 0.0
-    return pstdev(values)
+    return stdev(values)
 
 
 def _write_json(path: Path, payload: Any) -> None:

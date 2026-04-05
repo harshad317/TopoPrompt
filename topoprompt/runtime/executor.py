@@ -363,9 +363,13 @@ def _majority_vote(values: list[Any]) -> Any | None:
             key_order.append(vote_key)
         grouped[vote_key].append(value)
 
+    # Break ties by first-seen order (stable, problem-neutral).
+    # Previously used string length as the tiebreaker, which is arbitrary and
+    # biased for classification tasks (e.g. "no" always beat "yes").
     winning_key = max(key_order, key=lambda key: (len(grouped[key]), -key_order.index(key)))
     winners = grouped[winning_key]
-    return min(winners, key=lambda item: (len(str(item).strip()), str(item).strip().lower()))
+    # Return the first occurrence of the winning label to preserve insertion order.
+    return winners[0]
 
 
 def _normalize_vote_key(value: Any) -> str:

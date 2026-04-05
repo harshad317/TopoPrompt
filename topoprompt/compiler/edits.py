@@ -393,11 +393,25 @@ def _swap_branch_target(program: PromptProgram, route_node_id: str) -> None:
 def _rewrite_prompt_module(program: PromptProgram, edit: CandidateEdit) -> None:
     target_nodes = program.nodes if edit.target_node_id is None else [program.node_map()[edit.target_node_id]]
     instruction = edit.rewrite_instruction or "Make the prompt more task-specific."
+    rewrote_any = False
     for node in target_nodes:
         for module in node.prompt_modules:
             if edit.module_role is None or module.role == edit.module_role:
                 module.text = f"{module.text.rstrip()} {instruction}".strip()
-                return
+                rewrote_any = True
+                # When a specific target node is given, rewrite only the first
+                # matching module within that node (intentional single-module edit).
+                # When targeting all nodes (target_node_id is None), rewrite the
+                # first matching module in each node so the instruction propagates
+                # across the whole program.
+                break
+    # If nothing was rewritten (e.g. no module with the requested role exists),
+    # fall back to rewriting the first module of the first node.
+    if not rewrote_any and target_nodes:
+        node = target_nodes[0]
+        if node.prompt_modules:
+            module = node.prompt_modules[0]
+            module.text = f"{module.text.rstrip()} {instruction}".strip()
 
 
 def _default_insert_input_keys(node_type: NodeType) -> list[str]:
