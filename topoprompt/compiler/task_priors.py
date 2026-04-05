@@ -278,7 +278,7 @@ def heuristic_task_analysis(
     )
     needs_reasoning = reasoning_signal or task_family in {"code", "math_reasoning", "reasoning"}
     needs_verification = (
-        task_family in {"code", "instruction_following"}
+        task_family in {"code", "instruction_following", "reasoning", "math_reasoning"}
         or math_signal
         or (task_family == "extraction" and output_format == "json")
         or _contains_any(combined, ("verify", "verification", "check", "validate", "constraint"))
@@ -542,7 +542,11 @@ def _recommend_seed_templates(
             if input_heterogeneity != "low":
                 seeds.append("route_direct_or_solve_finalize")
         case "reasoning":
-            seeds.append("solve_verify_finalize" if needs_verification else "plan_solve_finalize")
+            # Always include both plan_solve and solve_verify — reasoning tasks
+            # (boolean logic, causal reasoning, temporal ordering, etc.) benefit
+            # from step-by-step solving AND self-verification regardless of whether
+            # explicit verification keywords appear in the task description.
+            seeds.extend(["plan_solve_finalize", "solve_verify_finalize"])
             if needs_decomposition:
                 seeds.append("decompose_solve_finalize")
             if input_heterogeneity != "low":
