@@ -13,7 +13,12 @@ from topoprompt.compiler.seeds import instantiate_seed_program
 from topoprompt.compiler.search import compile_task, evaluate_program_on_examples
 from topoprompt.config import TopoPromptConfig
 from topoprompt.eval.compare import compare_programs
-from topoprompt.eval.dspy_baselines import compare_dspy_programs, compare_topoprompt_vs_dspy, compile_dspy_baseline
+from topoprompt.eval.dspy_baselines import (
+    _require_dspy,
+    compare_dspy_programs,
+    compare_topoprompt_vs_dspy,
+    compile_dspy_baseline,
+)
 from topoprompt.eval.datasets import load_benchmark_examples, partition_examples
 from topoprompt.eval.metrics import metric_for_name
 from topoprompt.eval.significance import build_significance_summary
@@ -320,6 +325,8 @@ class BenchmarkRunner:
         progress_verbosity: int = 1,
     ) -> dict[str, Any]:
         normalized_benchmark = benchmark_name.lower()
+        normalized_optimizers = _normalize_optimizer_names(optimizers)
+        _require_dspy()
         examples = load_benchmark_examples(benchmark_name, path=examples_path, split=split)
         if any(example.target is None for example in examples):
             raise ValueError(
@@ -333,7 +340,6 @@ class BenchmarkRunner:
         partitions = partition_examples(examples, data_config=self.config.data, create_test_split=True)
         eval_examples = partitions.test_examples or partitions.validation_examples
         metric_fn = metric_for_name(normalized_benchmark)
-        normalized_optimizers = _normalize_optimizer_names(optimizers)
 
         out_dir = Path(output_dir) if output_dir is not None else None
         if out_dir is not None:

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import orjson
+import pytest
 
 from topoprompt.eval.benchmark_runner import BenchmarkRunner
 from topoprompt.schemas import CompileArtifact, CompileMetrics, PromptProgram, TaskSpec
@@ -144,3 +145,32 @@ def test_benchmark_runner_compile_and_compare_with_dspy_smoke(monkeypatch, fake_
     assert summary["pairwise_comparisons"]["mipro_vs_gepa"]["delta_a_minus_b"] == 0.04
     assert (tmp_path / "sst2_dspy_run" / "benchmark_dspy_summary.json").exists()
     assert (tmp_path / "sst2_dspy_run" / "benchmark_dspy_summary.md").exists()
+
+
+def test_benchmark_runner_compile_and_compare_with_dspy_fails_fast_without_dspy(
+    monkeypatch,
+    fake_backend,
+    small_config,
+):
+    compile_called = False
+
+    def fail_without_dspy():
+        raise RuntimeError("DSPy baselines require the optional `dspy` extra. Run `uv sync --extra dspy`.")
+
+    def fake_compile_task(**kwargs):
+        nonlocal compile_called
+        compile_called = True
+        raise AssertionError("compile_task should not run before the DSPy dependency check")
+
+    monkeypatch.setattr("topoprompt.eval.benchmark_runner._require_dspy", fail_without_dspy)
+    monkeypatch.setattr("topoprompt.eval.benchmark_runner.compile_task", fake_compile_task)
+
+    runner = BenchmarkRunner(config=small_config, backend=fake_backend)
+    with pytest.raises(RuntimeError, match="optional `dspy` extra"):
+        runner.compile_and_compare_with_dspy(
+            benchmark_name="gsm8k",
+            optimizers="topoprompt,mipro,gepa",
+            output_dir=None,
+        )
+
+    assert compile_called is False
