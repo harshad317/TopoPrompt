@@ -8,6 +8,8 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
+from topoprompt.compiler.task_priors import heuristic_task_analysis_from_prompt
+
 
 class BackendResponse(BaseModel):
     text: str
@@ -172,6 +174,8 @@ class FakeBackend(LLMBackend):
             "candidate_answer": answer,
             "answer": answer,
             "final_answer": answer,
+            "formatted_answer": self._format_answer(context, answer),
+            "critique": self._critique(context, answer),
             "rationale": "heuristic solution",
             "reasoning": "heuristic reasoning",
             "format_notes": "plain text",
@@ -181,34 +185,7 @@ class FakeBackend(LLMBackend):
         return {key: payload.get(key) for key in field_names}
 
     def _analysis_response(self, context: dict[str, Any], user_prompt: str) -> dict[str, Any]:
-        description = user_prompt.lower()
-        examples_text = json.dumps(context, sort_keys=True).lower()
-        needs_reasoning = bool(re.search(r"\d+\s*[\+\-\*/]", examples_text)) or "reason" in description or "math" in description
-        needs_verification = needs_reasoning or "constraint" in description or "follow" in description
-        needs_decomposition = "and" in examples_text and len(examples_text) > 80
-        heterogeneity = "high" if "choice" in examples_text and needs_reasoning else "medium" if needs_reasoning else "low"
-        seeds = ["direct_finalize", "solve_verify_finalize" if needs_verification else "plan_solve_finalize"]
-        if needs_reasoning:
-            seeds.append("plan_solve_finalize")
-        if heterogeneity != "low":
-            seeds.append("route_direct_or_solve_finalize")
-        return {
-            "task_family": "math_reasoning" if needs_reasoning else "instruction_following" if "instruction" in description else "factual_qa",
-            "output_format": "json" if "json" in description else "short_answer",
-            "needs_reasoning": needs_reasoning,
-            "needs_verification": needs_verification,
-            "needs_decomposition": needs_decomposition,
-            "input_heterogeneity": heterogeneity,
-            "candidate_routes": [
-                {"label": "direct", "description": "Use for direct or factual items."},
-                {"label": "solve", "description": "Use for multi-step or arithmetic items."},
-            ]
-            if heterogeneity != "low"
-            else [],
-            "initial_seed_templates": list(dict.fromkeys(seed for seed in seeds if seed)),
-            "analyzer_confidence": 0.72,
-            "rationale": "heuristic analyzer output",
-        }
+        return heuristic_task_analysis_from_prompt(user_prompt=user_prompt).model_dump(mode="json")
 
     def _choose_branch(self, context: dict[str, Any], user_prompt: str, properties: dict[str, Any]) -> str:
         labels = []
@@ -261,6 +238,21 @@ class FakeBackend(LLMBackend):
         candidate = str(context.get("candidate_answer", "")).strip().lower()
         expected = self._solve(context).strip().lower()
         return "PASS" if candidate == expected else "FAIL"
+
+    def _critique(self, context: dict[str, Any], expected_answer: str) -> str:
+        candidate = str(context.get("candidate_answer", "")).strip()
+        expected = str(expected_answer).strip()
+        if candidate and candidate.lower() == expected.lower():
+            return "The answer looks consistent with the task requirements."
+        if candidate:
+            return f"The answer appears incorrect; expected {expected} instead of {candidate}."
+        return f"Produce the answer {expected} and keep the response concise."
+
+    def _format_answer(self, context: dict[str, Any], answer: str) -> str:
+        candidate = context.get("candidate_answer")
+        if candidate is not None:
+            return str(candidate)
+        return str(answer)
 
     def _apply_operation(self, context: dict[str, Any]) -> int | float:
         a = float(context["a"])
@@ -332,4 +324,3 @@ def _solve_arithmetic_from_text(text: str) -> str | None:
     else:
         return None
     return str(int(result) if result.is_integer() else result)
-

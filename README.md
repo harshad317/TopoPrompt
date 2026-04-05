@@ -129,7 +129,7 @@ uv run python -m topoprompt.cli compile \
   --task-file ./tests/fixtures/smoke/gsm8k_task.md \
   --examples-file ./tests/fixtures/smoke/gsm8k_examples.jsonl \
   --output-dir ./runs/smoke_gsm8k \
-  --metric gsm8k \
+  --metric numeric \
   --fake-backend
 ```
 
@@ -155,7 +155,7 @@ uv run python -m topoprompt.cli evaluate \
   --program ./runs/smoke_gsm8k/final_program.json \
   --task-spec ./runs/smoke_gsm8k/task_spec.json \
   --dataset ./tests/fixtures/smoke/gsm8k_examples.jsonl \
-  --metric gsm8k \
+  --metric numeric \
   --fake-backend
 ```
 
@@ -177,7 +177,7 @@ artifact = compile_task(
             target="4",
         )
     ],
-    metric="gsm8k",
+    metric="numeric",
     backend=FakeBackend(),
     output_dir="./runs/api_example",
 )
@@ -258,7 +258,8 @@ Arguments:
 - `--examples-file`: JSONL examples
 - `--config`: optional config override file
 - `--output-dir`: run artifact directory
-- `--metric`: metric name such as `exact_match`, `gsm8k`, `mmlu`, `bbh`, or `ifeval`
+- `--metric`: canonical metric name such as `exact_match`, `numeric`, `multiple_choice`, `bbh`, or `ifeval`
+- Benchmark aliases like `gsm8k` and `mmlu` remain accepted for backward compatibility.
 - `--fake-backend`: use the deterministic fake backend instead of OpenAI
 
 ### Evaluate

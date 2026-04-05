@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from itertools import zip_longest
 from typing import Any, Callable
 
 from langdetect import LangDetectException, detect
@@ -12,17 +13,28 @@ from topoprompt.schemas import Example
 MetricFn = Callable[[Any, Example], float]
 
 
-def metric_for_name(name: str | None) -> MetricFn:
+def canonical_metric_name(name: str | None) -> str:
     normalized = (name or "exact_match").lower()
-    if normalized in {"exact_match", "accuracy"}:
+    aliases = {
+        "accuracy": "exact_match",
+        "gsm8k": "numeric",
+        "instruction_following": "ifeval",
+        "mmlu": "multiple_choice",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def metric_for_name(name: str | None) -> MetricFn:
+    normalized = canonical_metric_name(name)
+    if normalized == "exact_match":
         return exact_match_metric
-    if normalized in {"numeric", "gsm8k"}:
+    if normalized == "numeric":
         return numeric_metric
-    if normalized in {"multiple_choice", "mmlu"}:
+    if normalized == "multiple_choice":
         return multiple_choice_metric
-    if normalized in {"bbh"}:
+    if normalized == "bbh":
         return bbh_metric
-    if normalized in {"ifeval", "instruction_following"}:
+    if normalized == "ifeval":
         return ifeval_metric
     return exact_match_metric
 
@@ -32,8 +44,17 @@ def exact_match_metric(prediction: Any, example: Example) -> float:
 
 
 def numeric_metric(prediction: Any, example: Example) -> float:
-    pred_value = _extract_reference_number(prediction)
-    target_value = _extract_reference_number(example.target)
+    default_position = _normalize_number_position(example.metadata.get("numeric_position"))
+    prediction_position = _normalize_number_position(
+        example.metadata.get("prediction_numeric_position"),
+        default=default_position,
+    )
+    target_position = _normalize_number_position(
+        example.metadata.get("target_numeric_position"),
+        default=default_position,
+    )
+    pred_value = _extract_reference_number(prediction, number_position=prediction_position)
+    target_value = _extract_reference_number(example.target, number_position=target_position)
     if pred_value is None or target_value is None:
         return exact_match_metric(prediction, example)
     return 1.0 if abs(pred_value - target_value) < 1e-9 else 0.0
@@ -42,6 +63,12 @@ def numeric_metric(prediction: Any, example: Example) -> float:
 def multiple_choice_metric(prediction: Any, example: Example) -> float:
     pred = _normalize_text(prediction)
     target = _normalize_text(example.target)
+    target_label = _extract_choice_label(example.target)
+    prediction_labels = _extract_choice_prediction_labels(prediction, example)
+    if target_label is not None and target_label in prediction_labels:
+        return 1.0
+    if target_label is not None:
+        return 0.0
     if pred == target:
         return 1.0
     if pred[:1] == target[:1]:
@@ -50,9 +77,15 @@ def multiple_choice_metric(prediction: Any, example: Example) -> float:
 
 
 def bbh_metric(prediction: Any, example: Example) -> float:
-    if example.input.get("choices"):
+    if example.input.get("choices") or _extract_choice_label(example.target) is not None:
         return multiple_choice_metric(prediction, example)
-    return exact_match_metric(prediction, example)
+
+    target = _normalize_bbh_free_form(example.target)
+    if not target:
+        return exact_match_metric(prediction, example)
+
+    candidates = _extract_bbh_free_form_candidates(prediction)
+    return 1.0 if target in candidates else 0.0
 
 
 def ifeval_metric(prediction: Any, example: Example) -> float:
@@ -63,7 +96,7 @@ def ifeval_metric(prediction: Any, example: Example) -> float:
         prompt = str(example.input.get("prompt") or example.input.get("question") or "")
         scores = [
             _ifeval_instruction_metric(text, prompt, instruction_id, kwargs or {})
-            for instruction_id, kwargs in zip(instruction_ids, instruction_kwargs)
+            for instruction_id, kwargs in zip_longest(instruction_ids, instruction_kwargs, fillvalue={})
         ]
         return sum(scores) / len(scores) if scores else 0.0
 
@@ -165,8 +198,9 @@ def _ifeval_instruction_metric(text: str, prompt: str, instruction_id: str, kwar
         case "startend:end_checker":
             return 1.0 if stripped.endswith(str(kwargs.get("end_phrase", "")).strip()) else 0.0
         case "language:response_language":
-            expected = str(kwargs.get("language", "")).lower()
-            return 1.0 if expected and _detect_language(text) == expected else 0.0
+            expected = _normalize_language_identifier(kwargs.get("language"))
+            detected = _normalize_language_identifier(_detect_language(text))
+            return 1.0 if expected and detected and expected == detected else 0.0
         case _:
             return 0.0
 
@@ -175,6 +209,55 @@ def _normalize_text(value: Any) -> str:
     if value is None:
         return ""
     return re.sub(r"\s+", " ", str(value).strip().lower())
+
+
+def _extract_choice_label(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    match = re.fullmatch(r"[\(\[]?\s*([A-Z])\s*[\)\].]?", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).upper()
+
+
+def _extract_choice_prediction_labels(prediction: Any, example: Example) -> set[str]:
+    text = str(prediction or "").strip()
+    labels: set[str] = set()
+
+    direct_label = _extract_choice_label(text.rstrip("."))
+    if direct_label is not None:
+        labels.add(direct_label)
+
+    for match in re.finditer(r"\(([A-Z])\)", text, flags=re.IGNORECASE):
+        labels.add(match.group(1).upper())
+
+    keyword_pattern = re.compile(
+        r"(?:answer|final answer|option|choice|select|selected|pick|picked|choose|chosen)\s*(?:is|:)?\s*\(?([A-Z])\)?",
+        flags=re.IGNORECASE,
+    )
+    for match in keyword_pattern.finditer(text):
+        labels.add(match.group(1).upper())
+
+    stripped_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if stripped_lines:
+        last_line_label = _extract_choice_label(stripped_lines[-1].rstrip("."))
+        if last_line_label is not None:
+            labels.add(last_line_label)
+
+    choices = example.input.get("choices") or []
+    if isinstance(choices, list):
+        normalized_prediction = _normalize_text(text.rstrip("."))
+        normalized_last_line = _normalize_text(stripped_lines[-1].rstrip(".")) if stripped_lines else normalized_prediction
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            label = str(choice.get("label", "")).upper() or None
+            choice_text = _normalize_text(choice.get("text"))
+            if label and choice_text and choice_text in {normalized_prediction, normalized_last_line}:
+                labels.add(label)
+
+    return labels
 
 
 def _extract_number(value: Any) -> float | None:
@@ -186,17 +269,74 @@ def _extract_number(value: Any) -> float | None:
     return float(match.group(0))
 
 
-def _extract_reference_number(value: Any) -> float | None:
+def _extract_reference_number(value: Any, *, number_position: str = "last") -> float | None:
     if value is None:
         return None
+    if isinstance(value, (int, float)):
+        return float(value)
     text = str(value)
     marker_match = re.search(r"####\s*(-?\d+(?:\.\d+)?)", text)
     if marker_match:
         return float(marker_match.group(1))
+    answer_markers = re.findall(
+        r"(?:final answer|answer|result|total|therefore|thus)\s*(?:is|=|:)\s*(-?\d+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if answer_markers:
+        return float(_pick_number(answer_markers, number_position))
     matches = re.findall(r"-?\d+(?:\.\d+)?", text)
     if not matches:
         return None
-    return float(matches[-1])
+    return float(_pick_number(matches, number_position))
+
+
+def _pick_number(matches: list[str], number_position: str) -> str:
+    return matches[0] if _normalize_number_position(number_position) == "first" else matches[-1]
+
+
+def _normalize_number_position(value: Any, *, default: str = "last") -> str:
+    normalized = str(value or default).strip().lower()
+    return "first" if normalized == "first" else "last"
+
+
+def _normalize_bbh_free_form(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"^['\"`]+|['\"`]+$", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if re.fullmatch(r"[\[\]\(\)\{\}<> ]+", text):
+        return text
+    return text.rstrip(".!?,;:").strip().lower()
+
+
+def _extract_bbh_free_form_candidates(prediction: Any) -> set[str]:
+    text = str(prediction or "").strip()
+    if not text:
+        return {""}
+
+    stripped_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    candidates = {
+        _normalize_bbh_free_form(text),
+        _normalize_bbh_free_form(stripped_lines[-1]) if stripped_lines else "",
+    }
+
+    for match in re.finditer(
+        r"(?:final answer|answer|therefore|thus|so)\s*(?:is|:)?\s*(.+)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        candidates.add(_normalize_bbh_free_form(match.group(1)))
+
+    lowered = text.lower()
+    for token in ("yes", "no", "true", "false", "valid", "invalid"):
+        if re.search(rf"\b{token}\b", lowered):
+            candidates.add(token)
+
+    symbol_match = re.search(r"([\[\]\(\)\{\}<> ]+)[\.\!\?\"']*$", text)
+    if symbol_match:
+        candidates.add(_normalize_bbh_free_form(symbol_match.group(1)))
+
+    return {candidate for candidate in candidates if candidate}
 
 
 def _relation_holds(value: int, relation: Any, threshold: Any) -> bool:
@@ -255,3 +395,28 @@ def _detect_language(text: str) -> str | None:
         return detect(text)
     except LangDetectException:
         return None
+
+
+def _normalize_language_identifier(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    aliases = {
+        "english": "en",
+        "french": "fr",
+        "german": "de",
+        "spanish": "es",
+        "italian": "it",
+        "portuguese": "pt",
+        "russian": "ru",
+        "arabic": "ar",
+        "hindi": "hi",
+        "japanese": "ja",
+        "korean": "ko",
+        "chinese": "zh",
+    }
+    if text in aliases:
+        return aliases[text]
+    return text.split("-", 1)[0]

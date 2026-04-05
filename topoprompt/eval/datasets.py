@@ -47,7 +47,13 @@ def load_benchmark_examples(name: str, *, path: str | Path | None = None, split:
     elif normalized == "ifeval":
         return _load_ifeval_examples(split or "train")
     else:
-        raise ValueError(f"Unsupported benchmark: {name}")
+        candidate_path = Path(name).expanduser()
+        if candidate_path.is_file():
+            return load_examples_from_jsonl(candidate_path)
+        raise ValueError(
+            "Unsupported benchmark: "
+            f"{name}. Use one of gsm8k, mmlu, bbh, or ifeval, or pass a JSONL path via `name` or `path`."
+        )
 
 
 def partition_examples(
@@ -60,7 +66,15 @@ def partition_examples(
     if total == 0:
         return DatasetPartitions([], [], [], [], [])
 
-    if create_test_split:
+    stratify_key = _infer_partition_stratify_key(examples)
+    if stratify_key is not None:
+        compile_examples, validation_examples, test_examples = _partition_examples_stratified(
+            examples,
+            stratify_key=stratify_key,
+            data_config=data_config,
+            create_test_split=create_test_split,
+        )
+    elif create_test_split:
         compile_count = max(1, int(total * data_config.compile_fraction_if_no_official_split))
         validation_count = max(1, int(total * data_config.validation_fraction_if_no_official_split))
         compile_examples = examples[:compile_count]
@@ -136,6 +150,11 @@ def _load_bbh_examples(split: str) -> list[Example]:
         dataset = load_dataset("lukaemon/bbh", config_name, split=base_split)
         for index, row in enumerate(dataset):
             payload = dict(row)
+            prompt = payload.get("input") or payload.get("prompt")
+            if isinstance(prompt, str):
+                choices = _extract_bbh_choices(prompt)
+                if choices:
+                    payload["choices"] = choices
             metadata = dict(payload.get("metadata", {}) or {})
             metadata["bbh_task"] = config_name
             payload["metadata"] = metadata
@@ -203,3 +222,119 @@ def _normalize_choices(choices: Any) -> Any:
             for index, choice in enumerate(choices)
         ]
     return choices
+
+
+def _extract_bbh_choices(prompt: str) -> list[dict[str, str]] | None:
+    choices: list[dict[str, str]] = []
+    saw_options_header = False
+    for raw_line in prompt.splitlines():
+        line = raw_line.strip()
+        if not saw_options_header:
+            if line.lower().startswith("options:"):
+                saw_options_header = True
+            continue
+        match = re.match(r"^\(([A-Z])\)\s*(.+)$", line)
+        if match:
+            choices.append({"label": match.group(1), "text": match.group(2).strip()})
+            continue
+        if choices and line:
+            choices[-1]["text"] = f"{choices[-1]['text']} {line}".strip()
+    return choices or None
+
+
+def _infer_partition_stratify_key(examples: list[Example]) -> tuple[str, ...] | None:
+    if all(example.metadata.get("bbh_task") for example in examples):
+        return ("bbh_task",)
+    if all(example.metadata.get("instruction_id_list") for example in examples):
+        return ("instruction_id_list",)
+    return None
+
+
+def _partition_examples_stratified(
+    examples: list[Example],
+    *,
+    stratify_key: tuple[str, ...],
+    data_config: DataConfig,
+    create_test_split: bool,
+) -> tuple[list[Example], list[Example], list[Example]]:
+    grouped = _group_examples_by_stratify_key(examples, stratify_key=stratify_key)
+    compile_groups: list[list[Example]] = []
+    validation_groups: list[list[Example]] = []
+    test_groups: list[list[Example]] = []
+
+    for group_examples in grouped.values():
+        compile_count, validation_count, test_count = _group_split_counts(
+            len(group_examples),
+            data_config=data_config,
+            create_test_split=create_test_split,
+        )
+        compile_groups.append(group_examples[:compile_count])
+        validation_groups.append(group_examples[compile_count : compile_count + validation_count])
+        test_groups.append(group_examples[compile_count + validation_count : compile_count + validation_count + test_count])
+
+    return (
+        _interleave_example_groups(compile_groups),
+        _interleave_example_groups(validation_groups),
+        _interleave_example_groups(test_groups),
+    )
+
+
+def _group_examples_by_stratify_key(
+    examples: list[Example],
+    *,
+    stratify_key: tuple[str, ...],
+) -> dict[str, list[Example]]:
+    groups: dict[str, list[Example]] = {}
+    for example in examples:
+        if stratify_key == ("bbh_task",):
+            key = str(example.metadata.get("bbh_task"))
+        elif stratify_key == ("instruction_id_list",):
+            instruction_ids = example.metadata.get("instruction_id_list") or []
+            key = str(instruction_ids[0]) if instruction_ids else "__missing__"
+        else:
+            key = "__default__"
+        groups.setdefault(key, []).append(example)
+    return groups
+
+
+def _group_split_counts(
+    total: int,
+    *,
+    data_config: DataConfig,
+    create_test_split: bool,
+) -> tuple[int, int, int]:
+    if total <= 1:
+        return total, 0, 0
+    if create_test_split:
+        compile_count = max(1, int(total * data_config.compile_fraction_if_no_official_split))
+        validation_count = max(1, int(total * data_config.validation_fraction_if_no_official_split)) if total >= 3 else max(0, total - compile_count)
+        if compile_count + validation_count >= total:
+            if total >= 3:
+                while compile_count + validation_count >= total and validation_count > 1:
+                    validation_count -= 1
+                while compile_count + validation_count >= total and compile_count > 1:
+                    compile_count -= 1
+            else:
+                validation_count = total - compile_count
+        test_count = max(0, total - compile_count - validation_count)
+        return compile_count, validation_count, test_count
+
+    validation_count = max(1, int(total * data_config.validation_fraction_if_no_official_split))
+    if validation_count >= total:
+        validation_count = 1
+    compile_count = max(1, total - validation_count)
+    validation_count = total - compile_count
+    return compile_count, validation_count, 0
+
+
+def _interleave_example_groups(groups: list[list[Example]]) -> list[Example]:
+    non_empty_groups = [group for group in groups if group]
+    if not non_empty_groups:
+        return []
+    result: list[Example] = []
+    max_group_size = max(len(group) for group in non_empty_groups)
+    for index in range(max_group_size):
+        for group in non_empty_groups:
+            if index < len(group):
+                result.append(group[index])
+    return result

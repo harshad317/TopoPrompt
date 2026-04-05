@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-import re
 
 from topoprompt.backends.llm_client import LLMBackend
 from topoprompt.config import TopoPromptConfig
 from topoprompt.compiler.seeds import SEED_LIBRARY
+from topoprompt.compiler.task_priors import heuristic_task_analysis as _heuristic_task_analysis, normalize_task_family
 from topoprompt.schemas import Example, TaskAnalysis, TaskSpec
 
 
@@ -83,43 +83,21 @@ def analyze_task(
             max_output_tokens=config.model.max_output_tokens,
         )
         analysis = TaskAnalysis.model_validate(response.structured or json.loads(response.text))
+        analysis.task_family = normalize_task_family(analysis.task_family)
+        analysis.initial_seed_templates = list(dict.fromkeys(analysis.initial_seed_templates))[:5]
         _validate_analysis(analysis)
         return analysis
     except Exception:
-        return heuristic_task_analysis(task_spec=task_spec, examples=representative)
+        return heuristic_task_analysis(task_spec=task_spec, examples=representative, metric_name=metric_name)
 
 
-def heuristic_task_analysis(*, task_spec: TaskSpec, examples: list[Example]) -> TaskAnalysis:
-    combined = " ".join(json.dumps(example.input, sort_keys=True) for example in examples).lower()
-    description = task_spec.description.lower()
-    needs_reasoning = bool(re.search(r"\d+\s*[\+\-\*/]", combined)) or "math" in description or "reason" in description
-    needs_verification = needs_reasoning or "constraint" in description or "instruction" in description
-    needs_decomposition = " and " in combined and len(combined) > 100
-    heterogeneity = "high" if any(word in combined for word in ["option", "choice"]) and needs_reasoning else "medium" if needs_reasoning else "low"
-    seeds = ["direct_finalize", "plan_solve_finalize" if needs_reasoning else "solve_verify_finalize"]
-    if needs_verification:
-        seeds.append("solve_verify_finalize")
-    if heterogeneity != "low":
-        seeds.append("route_direct_or_solve_finalize")
-    return TaskAnalysis(
-        task_family="math_reasoning" if needs_reasoning else "instruction_following" if "instruction" in description else "factual_qa",
-        output_format="json" if "json" in description else "short_answer",
-        needs_reasoning=needs_reasoning,
-        needs_verification=needs_verification,
-        needs_decomposition=needs_decomposition,
-        input_heterogeneity=heterogeneity,
-        candidate_routes=(
-            [
-                {"label": "direct", "description": "Use for direct factual items."},
-                {"label": "solve", "description": "Use for reasoning items."},
-            ]
-            if heterogeneity != "low"
-            else []
-        ),
-        initial_seed_templates=list(dict.fromkeys(seed for seed in seeds if seed)),
-        analyzer_confidence=0.51,
-        rationale="Heuristic fallback analysis.",
-    )
+def heuristic_task_analysis(
+    *,
+    task_spec: TaskSpec,
+    examples: list[Example],
+    metric_name: str | None = None,
+) -> TaskAnalysis:
+    return _heuristic_task_analysis(task_spec=task_spec, examples=examples, metric_name=metric_name)
 
 
 def _validate_analysis(analysis: TaskAnalysis) -> None:
@@ -130,4 +108,3 @@ def _validate_analysis(analysis: TaskAnalysis) -> None:
     invalid = [seed for seed in analysis.initial_seed_templates if seed not in SEED_LIBRARY]
     if invalid:
         raise ValueError(f"Invalid seed templates from analyzer: {invalid}")
-
