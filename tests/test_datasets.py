@@ -78,6 +78,25 @@ def test_load_benchmark_examples_reads_ifeval_jsonl(monkeypatch, tmp_path: Path)
     assert examples[0].metadata["instruction_id_list"] == ["punctuation:no_comma"]
 
 
+def test_load_benchmark_examples_reads_sst2(monkeypatch):
+    def fake_load_dataset(name: str, split: str):
+        assert name == "stanfordnlp/sst2"
+        assert split == "train[:2]"
+        return [
+            {"idx": 11, "sentence": "A delightful surprise.", "label": 1},
+            {"idx": 12, "sentence": "A total mess.", "label": 0},
+        ]
+
+    monkeypatch.setattr("topoprompt.eval.datasets.load_dataset", fake_load_dataset)
+
+    examples = load_benchmark_examples("sst2", split="train[:2]")
+
+    assert [example.example_id for example in examples] == ["11", "12"]
+    assert examples[0].input == {"sentence": "A delightful surprise."}
+    assert examples[0].target == "positive"
+    assert examples[1].target == "negative"
+
+
 def test_load_benchmark_examples_uses_jsonl_path_when_name_is_not_builtin(tmp_path: Path):
     source = tmp_path / "custom_examples.jsonl"
     source.write_text('{"example_id":"custom_1","question":"What is 2 + 2?","target":"4"}\n')

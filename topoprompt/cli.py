@@ -127,6 +127,23 @@ def main() -> None:
     benchmark_family_parser.add_argument("--quiet", action="store_true")
     benchmark_family_parser.add_argument("-v", "--verbose", action="count", default=0)
 
+    benchmark_dspy_parser = subparsers.add_parser("benchmark-dspy")
+    benchmark_dspy_parser.add_argument("--benchmark", required=True, choices=["gsm8k", "sst2", "mmlu", "bbh", "ifeval"])
+    benchmark_dspy_parser.add_argument("--examples-file", default=None)
+    benchmark_dspy_parser.add_argument("--split", default=None)
+    benchmark_dspy_parser.add_argument("--task-file", default=None)
+    benchmark_dspy_parser.add_argument("--config", default=None)
+    benchmark_dspy_parser.add_argument("--output-dir", required=True)
+    benchmark_dspy_parser.add_argument("--optimizers", default="mipro,gepa")
+    benchmark_dspy_parser.add_argument("--compile-budget", type=int, default=None)
+    benchmark_dspy_parser.add_argument("--compare-repeats", type=int, default=1)
+    benchmark_dspy_parser.add_argument("--student-strategy", choices=["auto", "predict", "chain_of_thought"], default="auto")
+    benchmark_dspy_parser.add_argument("--model", default=None)
+    benchmark_dspy_parser.add_argument("--reflection-model", default=None)
+    benchmark_dspy_parser.add_argument("--optimizer-auto", choices=["light", "medium", "heavy"], default="light")
+    benchmark_dspy_parser.add_argument("--quiet", action="store_true")
+    benchmark_dspy_parser.add_argument("-v", "--verbose", action="count", default=0)
+
     args = parser.parse_args()
     config = load_config(getattr(args, "config", None))
 
@@ -295,6 +312,31 @@ def main() -> None:
             include_groups=group_names,
             compare_repeats=args.compare_repeats,
             compile_budget=args.compile_budget,
+            show_progress=not args.quiet,
+            progress_verbosity=1 + int(args.verbose or 0),
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "benchmark-dspy":
+        if args.model:
+            config.model.name = args.model
+        backend = OpenAIBackend()
+        runner = BenchmarkRunner(config=config, backend=backend)
+        task_description = Path(args.task_file).read_text().strip() if args.task_file else None
+        result = runner.compile_and_compare_with_dspy(
+            benchmark_name=args.benchmark,
+            optimizers=args.optimizers,
+            examples_path=args.examples_file,
+            split=args.split,
+            task_description=task_description,
+            output_dir=args.output_dir,
+            compare_repeats=args.compare_repeats,
+            compile_budget=args.compile_budget,
+            student_strategy=args.student_strategy,
+            model_name=args.model or config.model.name,
+            reflection_model_name=args.reflection_model,
+            optimizer_auto=args.optimizer_auto,
             show_progress=not args.quiet,
             progress_verbosity=1 + int(args.verbose or 0),
         )

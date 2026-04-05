@@ -39,6 +39,8 @@ def load_benchmark_examples(name: str, *, path: str | Path | None = None, split:
     if normalized == "gsm8k":
         dataset = load_dataset("gsm8k", "main", split=split or "train")
         return [_example_from_payload(row, fallback_id=f"{name}_{index}") for index, row in enumerate(dataset)]
+    elif normalized == "sst2":
+        return _load_sst2_examples(split or "train")
     elif normalized == "mmlu":
         dataset = load_dataset("cais/mmlu", "all", split=split or "validation")
         return [_example_from_payload(row, fallback_id=f"{name}_{index}") for index, row in enumerate(dataset)]
@@ -52,7 +54,7 @@ def load_benchmark_examples(name: str, *, path: str | Path | None = None, split:
             return load_examples_from_jsonl(candidate_path)
         raise ValueError(
             "Unsupported benchmark: "
-            f"{name}. Use one of gsm8k, mmlu, bbh, or ifeval, or pass a JSONL path via `name` or `path`."
+            f"{name}. Use one of gsm8k, sst2, mmlu, bbh, or ifeval, or pass a JSONL path via `name` or `path`."
         )
 
 
@@ -188,6 +190,30 @@ def _load_ifeval_examples(split: str) -> list[Example]:
             if selection.step is None and selection.stop is not None and len(examples) >= selection.stop:
                 return _apply_selection(examples, selection)
     return _apply_selection(examples, selection)
+
+
+def _load_sst2_examples(split: str) -> list[Example]:
+    dataset = load_dataset("stanfordnlp/sst2", split=split)
+    examples: list[Example] = []
+    for index, row in enumerate(dataset):
+        label = row.get("label")
+        target = None
+        if label is not None and int(label) >= 0:
+            target = "positive" if int(label) == 1 else "negative"
+        metadata = {
+            key: value
+            for key, value in row.items()
+            if key not in {"idx", "sentence", "label"}
+        }
+        examples.append(
+            Example(
+                example_id=str(row.get("idx", f"sst2_{index}")),
+                input={"sentence": str(row.get("sentence", ""))},
+                target=target,
+                metadata=metadata,
+            )
+        )
+    return examples
 
 
 def _parse_split_spec(split: str | None, *, default_split: str) -> tuple[str, slice]:

@@ -12,6 +12,7 @@ from topoprompt.compiler.seeds import instantiate_seed_program
 from topoprompt.compiler.search import compile_task, evaluate_program_on_examples
 from topoprompt.config import TopoPromptConfig
 from topoprompt.eval.compare import compare_programs
+from topoprompt.eval.dspy_baselines import compare_topoprompt_vs_dspy, compile_dspy_baseline
 from topoprompt.eval.datasets import load_benchmark_examples, partition_examples
 from topoprompt.eval.metrics import metric_for_name
 from topoprompt.eval.significance import build_significance_summary
@@ -20,6 +21,7 @@ from topoprompt.schemas import CompileArtifact, Example, PromptProgram, TaskAnal
 
 DEFAULT_BENCHMARK_TASKS = {
     "gsm8k": "Solve grade-school math word problems accurately.",
+    "sst2": "Classify the sentiment of each sentence as positive or negative.",
     "mmlu": "Answer multiple-choice knowledge questions correctly.",
     "bbh": "Solve diverse reasoning tasks with the correct final answer.",
     "ifeval": "Follow instructions precisely and satisfy all stated constraints.",
@@ -298,6 +300,130 @@ class BenchmarkRunner:
             (out_dir / "family_summary.md").write_text(_render_family_summary(summary))
         return summary
 
+    def compile_and_compare_with_dspy(
+        self,
+        *,
+        benchmark_name: str,
+        optimizers: str | list[str] | tuple[str, ...] = ("mipro", "gepa"),
+        examples_path: str | Path | None = None,
+        split: str | None = None,
+        task_description: str | None = None,
+        output_dir: str | Path | None = None,
+        compare_repeats: int = 1,
+        compile_budget: int | None = None,
+        student_strategy: str = "auto",
+        model_name: str | None = None,
+        reflection_model_name: str | None = None,
+        optimizer_auto: str = "light",
+        show_progress: bool = False,
+        progress_verbosity: int = 1,
+    ) -> dict[str, Any]:
+        normalized_benchmark = benchmark_name.lower()
+        examples = load_benchmark_examples(benchmark_name, path=examples_path, split=split)
+        if any(example.target is None for example in examples):
+            raise ValueError(
+                "Benchmark comparison requires labeled examples. Choose a split with targets."
+            )
+
+        task_description = task_description or DEFAULT_BENCHMARK_TASKS.get(
+            normalized_benchmark,
+            f"Solve the {normalized_benchmark} task accurately.",
+        )
+        partitions = partition_examples(examples, data_config=self.config.data, create_test_split=True)
+        eval_examples = partitions.test_examples or partitions.validation_examples
+        metric_fn = metric_for_name(normalized_benchmark)
+        normalized_optimizers = _normalize_optimizer_names(optimizers)
+
+        out_dir = Path(output_dir) if output_dir is not None else None
+        if out_dir is not None:
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+        topoprompt_dir = out_dir / "topoprompt" if out_dir is not None else None
+        artifact = compile_task(
+            task_description=task_description,
+            examples=examples,
+            search_examples=partitions.search_examples,
+            validation_examples=partitions.validation_examples,
+            fewshot_examples=partitions.fewshot_examples,
+            metric=normalized_benchmark,
+            backend=self.backend,
+            config=self.config,
+            compile_budget=compile_budget,
+            output_dir=topoprompt_dir,
+            task_id=f"{normalized_benchmark}_compiled",
+            show_progress=show_progress,
+            progress_verbosity=progress_verbosity,
+        )
+
+        comparison_summaries: dict[str, dict[str, Any]] = {}
+        for optimizer_name in normalized_optimizers:
+            dspy_dir = out_dir / f"dspy_{optimizer_name}" if out_dir is not None else None
+            dspy_result = compile_dspy_baseline(
+                optimizer_name=optimizer_name,
+                task_spec=artifact.task_spec,
+                train_examples=partitions.compile_examples,
+                val_examples=partitions.validation_examples,
+                metric_fn=metric_fn,
+                config=self.config,
+                student_strategy=student_strategy,
+                model_name=model_name or self.config.model.name,
+                reflection_model_name=reflection_model_name,
+                optimizer_auto=optimizer_auto,
+                output_dir=dspy_dir,
+                show_progress=show_progress,
+                progress_verbosity=progress_verbosity,
+            )
+            compare_dir = out_dir / f"compare_topoprompt_vs_{optimizer_name}" if out_dir is not None else None
+            compare_summary = compare_topoprompt_vs_dspy(
+                topoprompt_program=artifact.program_ir,
+                dspy_program=dspy_result["program"],
+                task_spec=artifact.task_spec,
+                examples=eval_examples,
+                metric_fn=metric_fn,
+                backend=self.backend,
+                config=self.config,
+                dspy_model_name=model_name or self.config.model.name,
+                label_topoprompt="topoprompt",
+                label_dspy=f"dspy_{optimizer_name}",
+                repeats=compare_repeats,
+                output_dir=compare_dir,
+                show_progress=show_progress,
+                progress_verbosity=progress_verbosity,
+            )
+            comparison_summaries[optimizer_name] = {
+                "optimizer_name": optimizer_name,
+                "dspy_program_id": dspy_result["summary"]["program_id"],
+                "student_strategy": dspy_result["summary"]["student_strategy"],
+                "compile_seconds": dspy_result["summary"]["compile_seconds"],
+                "topoprompt_score": compare_summary["score_a_mean"],
+                "dspy_score": compare_summary["score_b_mean"],
+                "topoprompt_minus_dspy": compare_summary["score_delta_a_minus_b_mean"],
+                "mcnemar_exact_p_value": _compare_p_value(compare_summary),
+                "dspy_output_dir": str(dspy_dir) if dspy_dir is not None else None,
+                "compare_output_dir": str(compare_dir) if compare_dir is not None else None,
+            }
+
+        summary = {
+            "benchmark_name": normalized_benchmark,
+            "task_description": task_description,
+            "metric_name": normalized_benchmark,
+            "task_family": artifact.task_spec.task_family,
+            "source_examples": len(examples),
+            "train_examples": len(partitions.compile_examples),
+            "validation_examples": len(partitions.validation_examples),
+            "eval_examples": len(eval_examples),
+            "topoprompt": {
+                "program_id": artifact.program_ir.program_id,
+                "validation_score": artifact.metrics.final_program_score,
+                "output_dir": str(topoprompt_dir) if topoprompt_dir is not None else artifact.output_dir,
+            },
+            "comparisons": comparison_summaries,
+        }
+        if out_dir is not None:
+            _write_json(out_dir / "benchmark_dspy_summary.json", summary)
+            (out_dir / "benchmark_dspy_summary.md").write_text(_render_benchmark_dspy_summary(summary))
+        return summary
+
 
 def group_benchmark_examples(
     *,
@@ -450,6 +576,25 @@ def _compare_p_value(summary: dict[str, Any]) -> float | None:
     return repeat_results[0].get("mcnemar_exact_p_value")
 
 
+def _normalize_optimizer_names(optimizers: str | list[str] | tuple[str, ...]) -> list[str]:
+    if isinstance(optimizers, str):
+        raw_values = [value.strip() for value in optimizers.split(",")]
+    else:
+        raw_values = [str(value).strip() for value in optimizers]
+    normalized_values: list[str] = []
+    for value in raw_values:
+        if not value:
+            continue
+        normalized = "mipro" if value.lower() == "miprov2" else value.lower()
+        if normalized not in {"mipro", "gepa"}:
+            raise ValueError(f"Unsupported DSPy optimizer: {value}")
+        if normalized not in normalized_values:
+            normalized_values.append(normalized)
+    if not normalized_values:
+        raise ValueError("At least one DSPy optimizer is required.")
+    return normalized_values
+
+
 def _slugify_group_name(value: str) -> str:
     return "".join(ch if ch.isalnum() else "_" for ch in value.lower()).strip("_") or "group"
 
@@ -481,6 +626,35 @@ def _render_family_summary(summary: dict[str, Any]) -> str:
             f"{group_name} | {task_names} | {payload['eval_examples']} | "
             f"{payload['compiled_score']:.4f} | {payload['direct_score']:.4f} | {payload['compiled_minus_direct']:+.4f} | {payload['compiled_vs_direct_mcnemar_p']} | "
             f"{payload['direct_x3_score']:.4f} | {payload['compiled_minus_direct_x3']:+.4f} | {payload['compiled_vs_direct_x3_mcnemar_p']} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _render_benchmark_dspy_summary(summary: dict[str, Any]) -> str:
+    lines = [
+        "# TopoPrompt vs DSPy Benchmark Summary",
+        "",
+        f"- Benchmark: `{summary['benchmark_name']}`",
+        f"- Task family: `{summary['task_family']}`",
+        f"- Metric: `{summary['metric_name']}`",
+        f"- Source examples: `{summary['source_examples']}`",
+        f"- Train examples: `{summary['train_examples']}`",
+        f"- Validation examples: `{summary['validation_examples']}`",
+        f"- Eval examples: `{summary['eval_examples']}`",
+        f"- TopoPrompt program: `{summary['topoprompt']['program_id']}`",
+        f"- TopoPrompt validation score: `{summary['topoprompt']['validation_score']:.4f}`",
+        "",
+        "## Comparisons",
+        "",
+        "| Optimizer | DSPy Program | Student | TopoPrompt | DSPy | Delta | p |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: |",
+    ]
+    for optimizer_name, payload in summary["comparisons"].items():
+        lines.append(
+            "| "
+            f"{optimizer_name} | {payload['dspy_program_id']} | {payload['student_strategy']} | "
+            f"{payload['topoprompt_score']:.4f} | {payload['dspy_score']:.4f} | "
+            f"{payload['topoprompt_minus_dspy']:+.4f} | {payload['mcnemar_exact_p_value']} |"
         )
     return "\n".join(lines) + "\n"
 
