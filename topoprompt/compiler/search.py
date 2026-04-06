@@ -186,7 +186,13 @@ def compile_task(
 
     direct_baseline = next((evaluation for evaluation in seed_evals if evaluation.program.program_id == "direct_finalize"), None)
     best_non_direct = max((evaluation.score for evaluation in seed_evals if evaluation.program.program_id != "direct_finalize"), default=0.0)
-    if direct_baseline is not None and best_non_direct < direct_baseline.score - config.compile.reseed_margin:
+    # Screening noise floor: with N examples, each example = 1/N score unit.
+    # Suppress reseed unless the gap is larger than 2× the noise floor — otherwise
+    # direct_finalize wins by chance on a small sample and poisons the entire search.
+    _screening_n = max(config.compile.screening_examples, 1)
+    _noise_floor = 2.0 / _screening_n
+    _reseed_threshold = max(config.compile.reseed_margin, _noise_floor)
+    if direct_baseline is not None and best_non_direct < direct_baseline.score - _reseed_threshold:
         reporter.log(
             "Analyzer-ranked seeds underperformed the direct baseline. Re-seeding from the full library.",
         )
@@ -236,6 +242,38 @@ def compile_task(
     seed_evals = posterior.rank(seed_evals)
 
     beam = _select_diverse_beam(seed_evals, width=config.compile.beam_width, min_families=config.compile.min_structural_families)
+    # Guarantee at least one structured (non-flat) topology in the initial beam.
+    # "Flat" means the program is just direct_finalize or a single-node solve/format.
+    # Screening noise on 8 examples (±0.125) can make direct_finalize appear best
+    # and crowd out plan/verify/route seeds that would win on more examples.
+    _flat_program_ids = {"direct_finalize", "format_finalize", "direct_self_consistency_x3"}
+    _beam_has_structured = any(
+        not any(c.program.program_id.startswith(flat) for flat in _flat_program_ids)
+        for c in beam
+    )
+    if not _beam_has_structured:
+        _structured_seeds = [
+            s for s in seed_evals
+            if not any(s.program.program_id.startswith(flat) for flat in _flat_program_ids)
+            and s.topology_fingerprint not in {c.topology_fingerprint for c in beam}
+        ]
+        if _structured_seeds:
+            _best_structured = max(_structured_seeds, key=lambda s: (s.score, s.search_score))
+            if len(beam) >= config.compile.beam_width:
+                # Replace the weakest flat candidate with the best structured seed
+                _weakest_flat_idx = min(
+                    (i for i, c in enumerate(beam) if any(c.program.program_id.startswith(f) for f in _flat_program_ids)),
+                    key=lambda i: (beam[i].score, beam[i].search_score),
+                    default=None,
+                )
+                if _weakest_flat_idx is not None:
+                    beam[_weakest_flat_idx] = _best_structured
+            else:
+                beam.append(_best_structured)
+            reporter.log(
+                f"Injected structured seed {_best_structured.program.program_id} "
+                f"(score={_best_structured.score:.4f}) to ensure topology diversity in initial beam.",
+            )
     beam_family_count_by_round = [len({candidate.family_signature for candidate in beam})] if beam else [0]
     best_beam_score = max((candidate.score for candidate in beam), default=0.0)
     # Track the single best candidate seen at any point in the search so it
