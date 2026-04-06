@@ -3,7 +3,7 @@ model:
   repair_model: null
   embedding_model: text-embedding-3-small
   temperature: 0.0
-  max_output_tokens: 800
+  max_output_tokens: 2000
 
 compile:
   budget_unit: llm_invocation

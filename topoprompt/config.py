@@ -42,7 +42,7 @@ class ModelConfig(BaseModel):
     repair_model: str | None = None
     embedding_model: str | None = "text-embedding-3-small"
     temperature: float = 0.0
-    max_output_tokens: int = 800
+    max_output_tokens: int = 2000
 
 
 class CompileConfig(BaseModel):

@@ -205,8 +205,14 @@ def evaluate_dspy_program_on_examples(
     ) if reporter is not None else dspy_examples
     with dspy.context(lm=lm):
         for dspy_example in iterable:
-            prediction = program(**dspy_example.inputs())
-            final_output = _extract_prediction_value(prediction, output_field=output_field)
+            parse_failed = 0
+            try:
+                prediction = program(**dspy_example.inputs())
+                final_output = _extract_prediction_value(prediction, output_field=output_field)
+            except Exception:
+                # AdapterParseError (truncation / repetition loop) → score 0, don't crash
+                final_output = None
+                parse_failed = 1
             source_example = _restore_topoprompt_example(dspy_example)
             score = float(metric_fn(final_output, source_example))
             traces.append(
@@ -215,7 +221,7 @@ def evaluate_dspy_program_on_examples(
                     "final_output": final_output,
                     "correctness": score,
                     "total_invocations": estimated_invocations,
-                    "parse_failures": 0,
+                    "parse_failures": parse_failed,
                 }
             )
             scores.append(score)
