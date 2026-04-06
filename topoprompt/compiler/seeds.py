@@ -46,6 +46,10 @@ def instantiate_direct_self_consistency_program(
     if attempts < 2:
         raise ValueError("Self-consistency baseline requires at least 2 attempts.")
 
+    # Attempt nodes stay context-independent because each one reads only
+    # `task_input`. We still chain them linearly so the current executor and
+    # validator see a single-entry DAG and evaluate all attempts before
+    # majority-vote finalize runs.
     nodes = []
     edges: list[ProgramEdge] = []
     answer_keys: list[str] = []
@@ -70,7 +74,7 @@ def instantiate_direct_self_consistency_program(
                 *default_prompt_modules(NodeType.DIRECT, task_analysis=analysis),
                 PromptModule(
                     role="instruction",
-                    text=f"This is independent attempt {attempt_index} of {attempts}. Do not reference prior attempts.",
+                    text=f"This is independent attempt {attempt_index} of {attempts}. Do not reference any other attempt.",
                 ),
             ],
             task_analysis=analysis,

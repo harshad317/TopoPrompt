@@ -47,10 +47,13 @@ class ModelConfig(BaseModel):
 
 class CompileConfig(BaseModel):
     budget_unit: str = "llm_invocation"
-    total_budget_calls: int = 500
+    total_budget_calls: int = 600
     analyzer_budget_calls: int = 20
     seed_budget_calls: int = 60
-    screening_budget_calls: int = 240
+    # screening_budget_calls absorbs the extra ~100 calls from LLM rewrites
+    # (rewrite_prompt_module now charges 1 unit per call to stay honest with
+    # the BudgetLedger, matching _synthesize_failure_grounded_rewrite_edit).
+    screening_budget_calls: int = 340
     narrowing_budget_calls: int = 110
     confirmation_budget_calls: int = 50
     reserve_budget_calls: int = 20

@@ -11,7 +11,9 @@ from topoprompt.schemas import Example, TaskAnalysis, TaskSpec
 
 
 ANALYZER_SYSTEM_PROMPT = """You are the TopoPrompt task analyzer.
-Your job is to infer what prompt-program structures are plausible for a task.
+Your job is to infer what prompt-program structures are plausible for a task
+AND to write concise, task-specific instruction text for each node type that
+would appear in those structures.
 You are not solving the task itself.
 You must output strict JSON only.
 
@@ -21,6 +23,11 @@ Guidelines:
 - Recommend verification only when errors are costly or the task is constraint-heavy.
 - Recommend decomposition only when the examples show multi-part reasoning.
 - Keep the number of suggested seed templates small.
+- In node_instructions, write 1-2 sentence instruction strings that are
+  specific to the task — not generic placeholders.  The text should tell the
+  model exactly what to do for THIS task, e.g. for a math task the solve node
+  should say something like "Solve the arithmetic word problem step by step,
+  tracking all intermediate quantities and units." not "Solve the task."
 """
 
 
@@ -45,7 +52,15 @@ def analyze_task(
         + "\n".join(f"- {seed}" for seed in SEED_LIBRARY)
         + "\n\nReturn JSON with these fields:\n"
         "- task_family\n- output_format\n- needs_reasoning\n- needs_verification\n- needs_decomposition\n"
-        "- input_heterogeneity\n- candidate_routes\n- initial_seed_templates\n- analyzer_confidence\n- rationale"
+        "- input_heterogeneity\n- candidate_routes\n- initial_seed_templates\n- analyzer_confidence\n- rationale\n"
+        "- node_instructions (object): task-specific instruction text for each relevant node type.\n"
+        "  Keys must be node type strings from: direct, plan, decompose, solve, verify, critique, route, format, finalize.\n"
+        "  Each value is a 1-2 sentence instruction string specific to this task.\n"
+        "  Include at least: direct, solve. Include others only if relevant to the task.\n"
+        "  Example for a math task: {\"direct\": \"Solve the arithmetic problem and return the numeric answer.\",\n"
+        "  \"solve\": \"Work through the word problem step by step, tracking intermediate values and units.\",\n"
+        "  \"verify\": \"Check that the numeric result is dimensionally consistent and satisfies the problem constraints.\",\n"
+        "  \"plan\": \"Write a short plan listing the quantities to find and the operations needed.\"}"
     )
     schema = {
         "type": "object",
@@ -60,6 +75,15 @@ def analyze_task(
             "initial_seed_templates": {"type": "array", "items": {"type": "string"}},
             "analyzer_confidence": {"type": "number"},
             "rationale": {"type": "string"},
+            "node_instructions": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "description": (
+                    "Task-specific instruction text keyed by node type string "
+                    "(direct, plan, decompose, solve, verify, critique, format, finalize). "
+                    "Each value is a 1-2 sentence instruction specific to this task."
+                ),
+            },
         },
         "required": [
             "task_family",

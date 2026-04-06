@@ -323,9 +323,69 @@ def heuristic_task_analysis(
         needs_decomposition=needs_decomposition,
         input_heterogeneity=input_heterogeneity,
     )
+    # --- Calibrated confidence estimation ---
+    # The previous implementation always returned 0.46, treating every
+    # heuristic inference as equally uncertain.  That disabled all confidence-
+    # gated downstream logic (seed prioritization, family-override guards,
+    # Bayesian posterior weighting) regardless of how strong the signal was.
+    #
+    # We now compute a real confidence in [0.30, 0.85] based on:
+    #   (a) whether the task_family is unambiguous (single strong signal)
+    #   (b) how many independent signals agree
+    #   (c) whether metric_hint provides hard evidence
+    #   (d) whether the inferred family is "other" / "mixed" (low confidence)
+    #
+    # 0.85 cap: heuristics can never be as reliable as an LLM-based analyzer,
+    # so we leave headroom for the LLM path to assert stronger confidence.
+    # 0.30 floor: even a weak heuristic is better than 0.0.
+
+    # Count agreeing signals for the winning family
+    family_signal_keys = {
+        "code": "code",
+        "summarization": "summarization",
+        "extraction": "extraction",
+        "generation": "generation",
+        "instruction_following": "instruction_following",
+        "classification": "classification",
+        "math_reasoning": "math_reasoning",
+        "reasoning": "reasoning",
+    }
+    winning_signals = sum(
+        int(family_signals.get(k, False))
+        for k in family_signal_keys
+        if k == task_family
+    )
+    # Secondary corroborating signals (e.g. metric_hint, structured output)
+    corroborating = 0
+    if metric_hint and task_family in {
+        "math_reasoning": ("gsm8k", "numeric"),
+        "classification": ("accuracy", "f1", "multiple_choice"),
+        "extraction": ("f1", "exact_match"),
+        "instruction_following": ("ifeval",),
+    }.get(task_family, ()):
+        corroborating += 1
+    if task_family == "classification" and (label_like_targets or label_like_prefixes):
+        corroborating += 1
+    if task_family == "extraction" and structured_output:
+        corroborating += 1
+
+    # Base confidence from unambiguity
+    if task_family in {"other", "mixed"}:
+        base_confidence = 0.30
+    elif strong_family_count == 1:
+        # Exactly one strong signal fired
+        base_confidence = 0.65
+    else:
+        # Multiple signals but one family still won cleanly via priority order
+        base_confidence = 0.45
+
+    # Boost for corroborating evidence
+    confidence = min(0.85, base_confidence + 0.08 * corroborating)
+
     rationale = (
         "Heuristic fallback inferred "
         f"task_family={task_family}, output_format={output_format}, "
+        f"confidence={confidence:.2f} (strong_signals={strong_family_count}, corroborating={corroborating}), "
         f"and seeds={', '.join(initial_seed_templates) or 'direct_finalize'}."
     )
 
@@ -338,7 +398,7 @@ def heuristic_task_analysis(
         input_heterogeneity=input_heterogeneity,
         candidate_routes=candidate_routes,
         initial_seed_templates=initial_seed_templates,
-        analyzer_confidence=0.46,
+        analyzer_confidence=confidence,
         rationale=rationale,
     )
 

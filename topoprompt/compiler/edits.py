@@ -296,7 +296,7 @@ def apply_edit(
             _rewrite_prompt_module(candidate, edit, analysis=analysis, backend=backend, config=config)
         case "add_fewshot_module":
             if fewshot_pool:
-                _add_fewshot_module(candidate, fewshot_pool[: min(3, len(fewshot_pool))])
+                _add_fewshot_module(candidate, _select_fewshot_examples(fewshot_pool, k=3))
         case "drop_fewshot_module":
             _drop_fewshot_module(candidate)
         case "change_finalize_format":
@@ -795,6 +795,59 @@ def _first_node_of_type(program: PromptProgram, node_type: NodeType) -> str | No
         if node.node_type == node_type:
             return node.node_id
     return None
+
+
+def _select_fewshot_examples(pool: list[Example], k: int = 3) -> list[Example]:
+    """Select k diverse, representative few-shot examples from the pool.
+
+    Strategy (no LLM required, O(n) time):
+    1. Prefer output diversity — pick one example per unique normalized target
+       label/value before repeating any label.  This mirrors what MIPRO's
+       labeled few-shot selection does: ensure the in-context distribution
+       covers the output space rather than clustering on the most-frequent label.
+    2. Among candidates with the same label, prefer shorter inputs (fits in
+       context more cheaply and reduces distraction).
+    3. Fall back to pool order if the pool is smaller than k.
+
+    Compared to the previous implementation (always `pool[:3]`), this change
+    avoids the common failure mode where the first 3 examples in the pool all
+    share the same target label (e.g. three "True" answers in a binary task),
+    giving the model no signal about negative cases.
+    """
+    if len(pool) <= k:
+        return list(pool)
+
+    # Group by normalized target so we can round-robin across output classes.
+    def _norm_target(ex: Example) -> str:
+        return str(ex.target or "").strip().lower()[:64]
+
+    # Sort each group internally by input length (ascending) — shorter = better
+    # in-context example because it leaves room for the actual task.
+    from collections import defaultdict
+    groups: dict[str, list[Example]] = defaultdict(list)
+    for ex in pool:
+        groups[_norm_target(ex)].append(ex)
+    for label in groups:
+        groups[label].sort(key=lambda ex: len(str(ex.input or "")))
+
+    # Round-robin across groups in order of group size (most-represented first,
+    # so we get at least one example from common classes).
+    sorted_groups = sorted(groups.values(), key=len, reverse=True)
+    selected: list[Example] = []
+    round_idx = 0
+    while len(selected) < k:
+        added_this_round = False
+        for group in sorted_groups:
+            if round_idx < len(group):
+                selected.append(group[round_idx])
+                added_this_round = True
+                if len(selected) == k:
+                    break
+        if not added_this_round:
+            break
+        round_idx += 1
+
+    return selected[:k]
 
 
 def _add_fewshot_module(program: PromptProgram, fewshot_examples: list[Example]) -> None:

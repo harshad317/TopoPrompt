@@ -15,40 +15,85 @@ def default_prompt_modules(
     fewshot_examples: Iterable[Example] | None = None,
 ) -> list[PromptModule]:
     task_family = task_analysis.task_family if task_analysis else "general"
+
+    # Pull task-specific instructions from the analyzer when available.
+    # node_instructions is keyed by node type value string (e.g. "direct",
+    # "solve").  When confidence is sufficient the analyzer populates this with
+    # concise, task-grounded instruction text so seeds start from a meaningful
+    # baseline rather than generic placeholders.
+    _node_instrs: dict[str, str] = (
+        task_analysis.node_instructions if task_analysis and task_analysis.node_instructions else {}
+    )
+
+    def _instr(node_key: str, fallback: str) -> str:
+        """Return task-specific instruction text if available, else the fallback."""
+        text = _node_instrs.get(node_key, "").strip()
+        return text if text else fallback
+
     modules: dict[NodeType, list[PromptModule]] = {
         NodeType.DIRECT: [
-            PromptModule(role="instruction", text=f"Answer the {task_family} task accurately."),
+            PromptModule(
+                role="instruction",
+                text=_instr("direct", f"Answer the {task_family} task accurately."),
+            ),
             PromptModule(role="format", text="Return only the candidate answer."),
         ],
         NodeType.PLAN: [
-            PromptModule(role="instruction", text="Produce a concise plan before solving."),
+            PromptModule(
+                role="instruction",
+                text=_instr("plan", "Produce a concise plan before solving."),
+            ),
             PromptModule(role="reasoning", text="Keep the plan short and actionable."),
         ],
         NodeType.DECOMPOSE: [
-            PromptModule(role="instruction", text="Break the task into a small number of subquestions."),
+            PromptModule(
+                role="instruction",
+                text=_instr("decompose", "Break the task into a small number of subquestions."),
+            ),
             PromptModule(role="reasoning", text="Prefer at most three subquestions."),
         ],
         NodeType.SOLVE: [
-            PromptModule(role="instruction", text=f"Solve the {task_family} task carefully."),
+            PromptModule(
+                role="instruction",
+                text=_instr("solve", f"Solve the {task_family} task carefully."),
+            ),
             PromptModule(role="reasoning", text="Work through the logic step by step, but keep it concise."),
             PromptModule(role="format", text="Output a candidate answer and a short rationale."),
         ],
         NodeType.VERIFY: [
-            PromptModule(role="verification", text="Check whether the candidate answer satisfies all task constraints."),
+            PromptModule(
+                role="verification",
+                text=_instr(
+                    "verify",
+                    "Check whether the candidate answer satisfies all task constraints.",
+                ),
+            ),
             PromptModule(role="format", text="Return PASS or FAIL with a short explanation."),
         ],
         NodeType.CRITIQUE: [
-            PromptModule(role="instruction", text="Identify flaws in the current candidate answer."),
+            PromptModule(
+                role="instruction",
+                text=_instr("critique", "Identify flaws in the current candidate answer."),
+            ),
         ],
         NodeType.ROUTE: [
-            PromptModule(role="instruction", text="Select the best execution branch for this input."),
+            PromptModule(
+                role="instruction",
+                text=_instr("route", "Select the best execution branch for this input."),
+            ),
             PromptModule(role="format", text="Return branch, confidence, and reason as JSON."),
         ],
         NodeType.FORMAT: [
-            PromptModule(role="format", text=f"Format the answer as {output_format or 'the requested output'}"),
+            PromptModule(
+                role="format",
+                text=_instr("format", f"Format the answer as {output_format or 'the requested output'}"),
+            ),
         ],
         NodeType.FINALIZE: [
-            PromptModule(role="format", text=f"Emit the final answer as {output_format or 'the requested output'}"),
+            PromptModule(
+                role="format",
+                text=_instr("finalize", f"Emit the final answer as {output_format or 'the requested output'}"),
+            ),
         ],
     }
     result = list(modules[node_type])

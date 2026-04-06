@@ -318,6 +318,16 @@ def compile_task(
                 )
             for edit in _dedupe_edits(edits):
                 try:
+                    # rewrite_prompt_module triggers a real LLM call inside
+                    # apply_edit (via _llm_rewrite_module_text).  Charge 1 unit
+                    # to the BudgetLedger BEFORE executing so the ledger stays
+                    # honest with respect to actual API usage.  If the budget is
+                    # already exhausted we skip the edit entirely, matching the
+                    # pattern used by _synthesize_failure_grounded_rewrite_edit
+                    # and _llm_guided_edit_proposals.
+                    if edit.edit_type == "rewrite_prompt_module" and backend is not None:
+                        if not budget.spend("screening", 1):
+                            continue
                     candidate = apply_edit(
                         program=parent.program,
                         edit=edit,
