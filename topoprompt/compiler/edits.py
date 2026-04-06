@@ -5,6 +5,13 @@ from topoprompt.config import TopoPromptConfig
 from topoprompt.ir import clone_program, outgoing_edges
 from topoprompt.schemas import CandidateEdit, Example, NodeType, ProgramEdge, PromptModule, PromptProgram, RouteSpec, TaskAnalysis
 
+# TYPE_CHECKING guard keeps the import from creating a circular dependency at
+# runtime (edits ← search ← edits).  The annotation is only used in function
+# signatures, so a string-form forward reference is sufficient.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from topoprompt.backends.llm_client import LLMBackend
+
 
 _DESTRUCTIVE_STRUCTURAL_EDIT_TYPES: frozenset[str] = frozenset({
     "replace_node_type",
@@ -217,6 +224,8 @@ def apply_edit(
     edit: CandidateEdit,
     analysis: TaskAnalysis,
     fewshot_pool: list[Example] | None = None,
+    backend: "LLMBackend | None" = None,
+    config: TopoPromptConfig | None = None,
 ) -> PromptProgram:
     candidate = clone_program(program, program_id=f"{program.program_id}__{edit.edit_type}")
     node_map = candidate.node_map()
@@ -284,7 +293,7 @@ def apply_edit(
                 raise ValueError("swap_branch_target requires target_node_id")
             _swap_branch_target(candidate, edit.target_node_id)
         case "rewrite_prompt_module":
-            _rewrite_prompt_module(candidate, edit)
+            _rewrite_prompt_module(candidate, edit, analysis=analysis, backend=backend, config=config)
         case "add_fewshot_module":
             if fewshot_pool:
                 _add_fewshot_module(candidate, fewshot_pool[: min(3, len(fewshot_pool))])
@@ -469,28 +478,109 @@ def _swap_branch_target(program: PromptProgram, route_node_id: str) -> None:
     first.target, second.target = second.target, first.target
 
 
-def _rewrite_prompt_module(program: PromptProgram, edit: CandidateEdit) -> None:
+def _rewrite_prompt_module(
+    program: PromptProgram,
+    edit: CandidateEdit,
+    *,
+    analysis: TaskAnalysis | None = None,
+    backend: "LLMBackend | None" = None,
+    config: TopoPromptConfig | None = None,
+) -> None:
     target_nodes = program.nodes if edit.target_node_id is None else [program.node_map()[edit.target_node_id]]
     instruction = edit.rewrite_instruction or "Make the prompt more task-specific."
-    rewrote_any = False
+
+    # Identify the first matching module (the one we will rewrite).
+    target_module: PromptModule | None = None
     for node in target_nodes:
         for module in node.prompt_modules:
             if edit.module_role is None or module.role == edit.module_role:
-                module.text = f"{module.text.rstrip()} {instruction}".strip()
-                rewrote_any = True
-                # When a specific target node is given, rewrite only the first
-                # matching module within that node (intentional single-module edit).
-                # When targeting all nodes (target_node_id is None), rewrite the
-                # first matching module in each node so the instruction propagates
-                # across the whole program.
+                target_module = module
                 break
-    # If nothing was rewritten (e.g. no module with the requested role exists),
-    # fall back to rewriting the first module of the first node.
-    if not rewrote_any and target_nodes:
-        node = target_nodes[0]
-        if node.prompt_modules:
-            module = node.prompt_modules[0]
-            module.text = f"{module.text.rstrip()} {instruction}".strip()
+        if target_module is not None:
+            break
+    # Fallback: use the first module of the first node if nothing matched.
+    if target_module is None and target_nodes and target_nodes[0].prompt_modules:
+        target_module = target_nodes[0].prompt_modules[0]
+    if target_module is None:
+        return
+
+    # --- LLM rewrite path ---
+    # When a backend is available, ask the model to produce a genuinely new
+    # module text rather than blindly appending the instruction.  This mirrors
+    # what DSPy instruction optimizers do: they generate a semantically new
+    # prompt, not an additive suffix.  The old text is provided as context so
+    # the model can preserve intent while applying the guidance.
+    if backend is not None and config is not None:
+        new_text = _llm_rewrite_module_text(
+            current_text=target_module.text,
+            role=target_module.role,
+            instruction=instruction,
+            task_family=analysis.task_family if analysis else "other",
+            backend=backend,
+            config=config,
+        )
+        if new_text:
+            target_module.text = new_text
+            target_module.origin = "llm_rewrite"
+            return
+
+    # --- Fallback: append-based rewrite (no backend available) ---
+    target_module.text = f"{target_module.text.rstrip()} {instruction}".strip()
+
+
+def _llm_rewrite_module_text(
+    *,
+    current_text: str,
+    role: str,
+    instruction: str,
+    task_family: str,
+    backend: "LLMBackend",
+    config: TopoPromptConfig,
+) -> str | None:
+    """Call the LLM to produce a new, semantically coherent prompt module text.
+
+    Returns the rewritten text, or None if the call fails (so callers can fall
+    back to the append-based path).
+    """
+    import json as _json
+    schema = {
+        "type": "object",
+        "properties": {
+            "rewritten_text": {
+                "type": "string",
+                "description": "The new prompt module text. Must be a complete, self-contained instruction — not a suffix or continuation of the original.",
+            }
+        },
+        "required": ["rewritten_text"],
+    }
+    system_prompt = (
+        "You are a prompt engineer improving a single prompt module inside a larger prompt program. "
+        "Rewrite the module text so it is specific, clear, and directly reflects the guidance provided. "
+        "Return only the rewritten text as a complete instruction — do not include the original text, "
+        "do not add meta-commentary, and do not append the guidance as a suffix."
+    )
+    user_prompt = (
+        f"Task family: {task_family}\n\n"
+        f"Module role: {role}\n\n"
+        f"Current module text:\n{current_text}\n\n"
+        f"Rewrite guidance:\n{instruction}\n\n"
+        "Produce a new, complete module text that incorporates the guidance. "
+        "Keep it concise (1-3 sentences) and actionable."
+    )
+    try:
+        response = backend.generate_structured(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema=schema,
+            model=config.model.name,
+            temperature=0.0,
+            max_output_tokens=256,
+        )
+        payload = response.structured or _json.loads(response.text)
+        new_text = str(payload.get("rewritten_text", "")).strip()
+        return new_text if new_text else None
+    except Exception:
+        return None
 
 
 def _default_insert_input_keys(node_type: NodeType) -> list[str]:

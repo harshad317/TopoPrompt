@@ -323,6 +323,8 @@ def compile_task(
                         edit=edit,
                         analysis=analysis,
                         fewshot_pool=partitions.fewshot_examples,
+                        backend=backend,
+                        config=config,
                     )
                     validate_program(candidate, config.program)
                     proposals.append((candidate, parent.program.program_id, edit.model_dump_json()))
