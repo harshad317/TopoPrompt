@@ -419,8 +419,16 @@ def compile_task(
             reporter.log("Search budgets exhausted; stopping.")
             break
 
+    # Always include all_time_best in confirmation, even if it was displaced from the beam.
+    # This prevents the final winner from being a search-phase artifact that scored well
+    # on 64 examples but poorly on the full validation set.
+    _confirm_pool = list(beam[: config.compile.confirm_top_k])
+    if all_time_best is not None and not any(
+        c.topology_fingerprint == all_time_best.topology_fingerprint for c in _confirm_pool
+    ):
+        _confirm_pool.insert(0, all_time_best)
     final_confirmation_candidates = _select_affordable_confirmation_candidates(
-        candidates=beam[: config.compile.confirm_top_k],
+        candidates=_confirm_pool,
         validation_examples=partitions.validation_examples,
         budget=budget,
         config=config,
@@ -1232,7 +1240,7 @@ def _confirm_candidates(
             budget=budget,
             phase="confirmation",
             stage="confirmation",
-            max_examples=min(len(validation_examples), config.compile.confirmation_examples),
+            max_examples=len(validation_examples),
             fewshot_examples=[],
             parent_id=candidate.parent_id,
             edit_applied=candidate.edit_applied,

@@ -7,16 +7,21 @@ from topoprompt.schemas import ProgramNode, TaskSpec
 
 
 NODE_ROLE_TEXT = {
-    "direct": "Produce a direct candidate answer.",
-    "plan": "Produce a concise plan that helps solve the task.",
-    "decompose": "Break the task into bounded subquestions.",
-    "solve": "Solve the task carefully using the provided context.",
-    "verify": "Check whether the candidate answer satisfies the task constraints.",
+    "direct": "Think step by step, then produce a candidate answer.",
+    "plan": "Think step by step, then produce a concise plan that helps solve the task.",
+    "decompose": "Think step by step, then break the task into bounded subquestions.",
+    "solve": "Think step by step, then solve the task carefully using the provided context.",
+    "verify": "Think step by step, then check whether the candidate answer satisfies the task constraints.",
     "critique": "Critique the current candidate answer.",
     "route": "Choose the best branch for execution.",
     "format": "Format the result into the required schema.",
     "finalize": "Emit the final answer.",
 }
+
+# Node types that require a 'reasoning' field — must appear first in the JSON
+# so the model commits to a reasoning chain before writing the answer (identical
+# to DSPy ChainOfThought behaviour).
+_REASONING_NODE_TYPES = {"direct", "plan", "decompose", "solve", "verify"}
 
 
 def render_node_prompt(task_spec: TaskSpec, node: ProgramNode, state: dict[str, Any]) -> tuple[str, str]:
@@ -54,6 +59,15 @@ def render_node_prompt(task_spec: TaskSpec, node: ProgramNode, state: dict[str, 
         )
     parts.append(f"Context JSON:\n{json.dumps(local_state, sort_keys=True)}")
     parts.append(f"Output JSON Schema:\n{json.dumps(node.expected_output_schema, sort_keys=True)}")
-    parts.append("Formatting Guardrails:\n- Return strict JSON only.\n- Do not omit required fields.")
+    guardrails = [
+        "- Return strict JSON only.",
+        "- Do not omit required fields.",
+    ]
+    if node.node_type.value in _REASONING_NODE_TYPES:
+        guardrails.append(
+            '- Write the "reasoning" field first, before any answer field. '
+            "Show your full step-by-step reasoning inside it."
+        )
+    parts.append("Formatting Guardrails:\n" + "\n".join(guardrails))
     user_prompt = "\n\n".join(parts)
     return system_prompt, user_prompt

@@ -72,41 +72,48 @@ def output_schema_for_node(node_type: NodeType) -> dict:
     schemas = {
         NodeType.DIRECT: {
             "type": "object",
+            # reasoning appears FIRST so the model must think before committing
+            # to candidate_answer — exactly like DSPy ChainOfThought.
             "properties": {
+                "reasoning": {"type": "string", "description": "Step-by-step reasoning before the answer."},
                 "candidate_answer": {"type": "string"},
-                "rationale": {"type": ["string", "null"]},
             },
-            "required": ["candidate_answer"],
+            "required": ["reasoning", "candidate_answer"],
         },
         NodeType.PLAN: {
             "type": "object",
-            "properties": {"plan": {"type": "string"}},
-            "required": ["plan"],
+            "properties": {
+                "reasoning": {"type": "string", "description": "Why this plan addresses the task."},
+                "plan": {"type": "string"},
+            },
+            "required": ["reasoning", "plan"],
         },
         NodeType.DECOMPOSE: {
             "type": "object",
             "properties": {
+                "reasoning": {"type": "string", "description": "Why these subquestions cover the task."},
                 "subquestions": {"type": "array", "items": {"type": "string"}},
                 "subquestion_answers": {"type": "array", "items": {"type": "string"}},
                 "decomposition_context": {"type": "string"},
             },
-            "required": ["subquestions"],
+            "required": ["reasoning", "subquestions"],
         },
         NodeType.SOLVE: {
             "type": "object",
             "properties": {
+                "reasoning": {"type": "string", "description": "Step-by-step reasoning before the answer."},
                 "candidate_answer": {"type": "string"},
-                "rationale": {"type": ["string", "null"]},
             },
-            "required": ["candidate_answer"],
+            "required": ["reasoning", "candidate_answer"],
         },
         NodeType.VERIFY: {
             "type": "object",
             "properties": {
+                "reasoning": {"type": "string", "description": "Step-by-step verification logic."},
                 "verification_result": {"type": "string"},
                 "explanation": {"type": ["string", "null"]},
             },
-            "required": ["verification_result"],
+            "required": ["reasoning", "verification_result"],
         },
         NodeType.CRITIQUE: {
             "type": "object",
